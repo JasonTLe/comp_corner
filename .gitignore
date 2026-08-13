@@ -1,6 +1,11 @@
 # CFD solver output — 1.4 GB, regenerable, too large for GitHub.
 # Meshes and results live on disk / shared storage, not in git.
-*.cgns
+meshes/*
+output_SA/*
+!output_SA/comp_corner_sa_000_surf.cgns
+!output_SA/comp_corner_sa_000_vol.cgns
+!meshes/comp_corner_14.cgns
+!meshes/comp_corner_14_fixed.cgns
 
 # WSL alternate-data-stream junk
 *:Zone.Identifier
