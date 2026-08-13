@@ -29,11 +29,9 @@ from baseclasses import AeroProblem
 from mpi4py import MPI
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--output", type=str, default="./output")
-parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_13_fixed.cgns")
+parser.add_argument("--output", type=str, default="./output_SA")
+parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_14_fixed.cgns")
 parser.add_argument("--task", choices=["analysis", "polar"], default="analysis")
-parser.add_argument("--nkSwitchTol", type=float, default=1e-2)
-parser.add_argument("--nCycles", type=int, default=20000)
 args = parser.parse_args()
 
 comm = MPI.COMM_WORLD
@@ -53,20 +51,21 @@ aeroOptions = {
     "solutionPrecision": "double",
     "gridPrecision": "double",
     # Physics Parameters
+    "eddyVisInfRatio": 0.2104, # makes ~v/v = 3, default is 1.342; apparently affects the location of the transition
     "equationType": "RANS",
-    "turbulenceModel": "SA", # SA-Edwards will be implemented in the second stage.
+    "turbulenceModel": "SA", # SA-Edwards will be implemented in the second stage
     "turbResScale": 1e5, # default
     # Solver Parameters
     "MGCycle": "2w",
-    "MGStartLevel": 1,  # Coarsening is not available on restart files?
-    "nSubiter": 1,
+    "MGStartLevel": 1,
+    "nSubiter": 1, # how many checks before the next timestep is taken
     "nSubiterTurb": 10,  # was 3; turbulence lags badly in segregated ANK at 3
-    "CFL": 1.5,
-    "CFLCoarse": 1.0,
+    "CFL": 1.5, # Value that directly affects timestep size
+    "CFLCoarse": 1.0, # Value that directly affects timestep size in coarse regions, usually lower than CFL 
     # ANK Solver Parameters
     "useANKSolver": True,
     "ANKSwitchTol": 1e10,
-    "ILUFill": 3,
+    "ILUFill": 3, # Your steering system, eats up memory but controls your CFL/timesteps
     # Default ANK is segregated: it solves the mean flow implicitly and leaves
     # nuTilde to nSubiterTurb DADI sweeps. On this case that stalls -- res rho
     # drops 4 orders while res nuturb *climbs* (8.7e-6 -> 1.6e-3) and totalRes
@@ -74,7 +73,7 @@ aeroOptions = {
     # Both switch tolerances default to 1e-16 in this build, i.e. never fire.
     # Coupled ANK puts nuTilde in the same implicit system as the mean flow;
     # second-order ANK is what actually gets the residual down asymptotically.
-    "ANKSecondOrdSwitchTol": 1e-2,
+    "ANKSecondOrdSwitchTol": 1e-3,
     # Coupled ANK is deliberately left OFF (1e-16 = never). It was tried at 1e-3
     # and made things worse: SANK descended 1.85e6 -> 1.98e5 over iters 110-299,
     # then coupled mode engaged at iter 302 and flatlined -- 80+ iterations with
@@ -87,10 +86,10 @@ aeroOptions = {
     # SANK's descent flattens around totalR ~2e5 (rel ~1e-3). NK is a true Newton
     # method and punches through where ANK's line search stalls, so hand off there
     # rather than at 1e-7 -- which ANK never reached in either earlier attempt.
-    "NKSwitchTol": args.nkSwitchTol,
+    "NKSwitchTol": 1e-4,
     # Termination Criteria
     "L2Convergence": 1e-10,
-    "nCycles": args.nCycles,
+    "nCycles": 20000,
 }
 
 ap = AeroProblem(

@@ -1,0 +1,11 @@
+# Secrets — never commit these
+.env
+.env.*
+*.key
+*.pem
+credentials*
+.claude/
+
+# Python
+__pycache__/
+*.pyc

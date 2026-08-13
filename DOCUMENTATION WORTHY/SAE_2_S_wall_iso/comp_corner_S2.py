@@ -52,21 +52,14 @@ from baseclasses import AeroProblem
 from mpi4py import MPI
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--output", type=str, default="./output_edwards")
-parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_13_fixed.cgns")
+parser.add_argument("--output", type=str, default="./output_SAE")
+parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_14_fixed.cgns")
 parser.add_argument(
     "--restartFile",
     type=str,
-    default="./output/comp_corner_sa_000_vol.cgns",
+    default="./output_SA/comp_corner_sa_000_vol.cgns",
     help="Double-precision volume CGNS written by comp_corner_sa.py",
 )
-# NOTE: ADflow counts nCycles against the cumulative "Iter Tot" column, not the
-# outer iteration count. With DADI the two are the same; with ANK they are not.
-# DADI needs ~23k cycles to take the Edwards restart from 4.5e4 down to the
-# 1.947e-4 that L2Convergence=1e-12 demands, so the old 20000 fell just short.
-parser.add_argument("--nCycles", type=int, default=40000)
-parser.add_argument("--CFL", type=float, default=5.0)
-parser.add_argument("--mgCycle", type=str, default="2w")
 args = parser.parse_args()
 
 comm = MPI.COMM_WORLD
@@ -94,7 +87,7 @@ aeroOptions = {
     "turbResScale": 1e5,  
     # Solver Parameters -- DADI
     "smoother": "DADI", # default
-    "MGCycle": args.mgCycle,
+    "MGCycle": "2w",
     # sg settings
     #"nSubiterTurb": 10,
     # multigrid settings
@@ -104,7 +97,7 @@ aeroOptions = {
     # CFL 1.5 is far too conservative for DADI here: it stalls at resrho ~1.6 and
     # the rate decays to ~3e-4/iter, which extrapolates to ~62k cycles -- past the
     # 20k budget. DADI is implicit and takes a much larger CFL than this.
-    "CFL": args.CFL,
+    "CFL": 5.0,
     "CFLCoarse": 1.0,
     # ANK / NK stay OFF by design -- stage 2 is deliberately a DADI run so the
     # Edwards source term settles in on the smoother, not inside a Newton solve.
@@ -124,7 +117,7 @@ aeroOptions = {
     # It is left on only as a harmless OR'd backstop.
     "L2Convergence": 1e-12,
     "L2ConvergenceRel": 1e-8,
-    "nCycles": args.nCycles,
+    "nCycles": 40000,
 }
 
 # Must match comp_corner_sa.py exactly.
