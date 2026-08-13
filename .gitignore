@@ -1,3 +1,14 @@
+# CFD solver output — 1.4 GB, regenerable, too large for GitHub.
+# Meshes and results live on disk / shared storage, not in git.
+*.cgns
+
+# WSL alternate-data-stream junk
+*:Zone.Identifier
+
+# Python
+__pycache__/
+*.pyc
+
 # Secrets — never commit these
 .env
 .env.*
@@ -5,7 +16,3 @@
 *.pem
 credentials*
 .claude/
-
-# Python
-__pycache__/
-*.pyc
