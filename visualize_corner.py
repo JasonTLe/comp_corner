@@ -100,6 +100,14 @@ GAM = 1.4                      # ratio of specific heats
 KARMAN, BLOG = 0.41, 5.2       # log-law constants
 MM = 1e3                       # metres -> millimetres, used in every plot
 
+# Target incoming boundary layer, from the experiments of Zheltovodov et al.
+# (1990) as used by Hao, JFM 2023, 971 A28 (low-Re case): delta = 2.27 mm
+# measured 15.4 delta upstream of the corner, giving Re_delta = 63560.  The
+# station is therefore fixed in space, unlike Case.x_ref which follows x_sep.
+DELTA_EXP = 2.27e-3            # experimental boundary-layer thickness, metres
+X_EXP = -15.4*DELTA_EXP        # station where it was measured, metres (x=0 = corner)
+RE_DELTA_EXP = 63560           # Re based on DELTA_EXP and free-stream properties
+
 # Sutherland's law for the dynamic viscosity of air, SI units.
 mu = lambda T: 1.458e-6 * T ** 1.5 / (T + 110.4)
 
@@ -769,6 +777,9 @@ class Case:
         Lsep        separation length
         delta0      boundary-layer thickness at the reference station
         Retau       friction Reynolds number there
+        delta_exp,  the same, at the experiment's fixed station X_EXP, plus
+        Retau_exp,  Re_delta = Re_m*delta_exp, for comparison against
+        Re_delta    DELTA_EXP and RE_DELTA_EXP
         profile     (y+, u+, u+_vanDriest) at the reference station
         beta_fit    shock angle fitted from the pressure field, degrees
         x_trans     laminar-to-turbulent transition location, NaN when the
@@ -938,6 +949,14 @@ class Case:
         # Incoming boundary layer, sampled 15 mm upstream of separation.
         self.x_ref = self.x_sep - 0.015
         self.delta0, self.Retau, self.profile = self.boundary_layer(self.x_ref)
+
+        # The same layer at the experiment's fixed station, for comparison with
+        # DELTA_EXP / RE_DELTA_EXP.  Kept separate from delta0 above: that one
+        # follows x_sep and so sits at a different x in every run, which makes
+        # it useless for checking whether the incoming layer matches the target.
+        self.x_exp = X_EXP
+        self.delta_exp, self.Retau_exp, self.profile_exp = self.boundary_layer(X_EXP)
+        self.Re_delta = self.Re_m*self.delta_exp
 
         # Ramp angle: straight-line fit through the downstream quarter of the wall.
         m = x > 0.25*x.max()
@@ -1383,6 +1402,13 @@ REPORT = [
                                 else 'none (fully turbulent)'),
     ('delta_0 [mm]',        lambda c: '%.3f' % (c.delta0*MM)),
     ('Re_tau',              lambda c: '%.0f' % c.Retau),
+    ('delta @ x_exp [mm]',  lambda c: '%.3f  at x = %.2f mm  (exp %.2f, %+.1f%%)'
+                                % (c.delta_exp*MM, c.x_exp*MM, DELTA_EXP*MM,
+                                   100*(c.delta_exp/DELTA_EXP - 1))),
+    ('Re_delta',            lambda c: '%.0f  (exp %d, %+.1f%%)'
+                                % (c.Re_delta, RE_DELTA_EXP,
+                                   100*(c.Re_delta/RE_DELTA_EXP - 1))),
+    ('Re_tau @ x_exp',      lambda c: '%.0f' % c.Retau_exp),
     ('x_sep [mm]',          lambda c: '%.2f' % (c.x_sep*MM)),
     ('x_reatt [mm]',        lambda c: '%.2f' % (c.x_rea*MM)),
     ('L_sep [mm]',          lambda c: '%.2f' % (c.Lsep*MM)),
@@ -1417,6 +1443,7 @@ def report(case):
 
 
 def main():
+    global DELTA_EXP, X_EXP
     ap = argparse.ArgumentParser(
         description='Visualize one ADflow surface-solution CGNS file.',
         epilog='Figures are named after the input file, e.g. '
@@ -1431,7 +1458,17 @@ def main():
                     help='print the table only, make no figures')
     ap.add_argument('--exag', type=float, default=3.5,
                     help='vertical exaggeration hint for the close-up panel')
+    ap.add_argument('--delta-exp', type=float, default=DELTA_EXP*MM, metavar='MM',
+                    help='experimental boundary-layer thickness in mm '
+                         '(default: %.2f, Zheltovodov low-Re case)' % (DELTA_EXP*MM))
+    ap.add_argument('--x-exp', type=float, default=None, metavar='MM',
+                    help='station where it is measured, mm upstream of the corner '
+                         '(default: 15.4 * delta-exp)')
     a = ap.parse_args()
+
+    # The station defaults to 15.4 delta, so it follows --delta-exp unless pinned.
+    DELTA_EXP = a.delta_exp/MM
+    X_EXP = -abs(a.x_exp)/MM if a.x_exp is not None else -15.4*DELTA_EXP
 
     if a.tree:
         h, root = load(a.gridFile)
