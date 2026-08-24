@@ -17,9 +17,15 @@ STAGE 1 of 2 -- standard SA with ANK/NK to produce a converged restart file.
 Writes ./output/comp_corner_sa_vol.cgns in DOUBLE precision, which
 comp_corner_sa_edwards.py then reloads as its restartFile.
 
-USAGE: mpiexec -n # python3.11 comp_corner_S1.py 
+USAGE: mpiexec -n 14 python3.11 comp_corner_S1.py
 
-""" 
+    nProc MATTERS. comp_corner_15_fixed.cgns is one 700x200x2 block; ADflow cuts
+    it into nProc pieces and every cut must survive multigrid coarsening. Only
+    nProc = 10 and 14 work with MGCycle "2w" on this grid (4/8/12 abort in
+    checkCoarse1to1). 14 is also the physical core count on this machine, so
+    anything above 14 is refused by OpenMPI for lack of slots.
+
+"""
 
 import numpy as np
 import argparse
@@ -29,20 +35,20 @@ from baseclasses import AeroProblem
 from mpi4py import MPI
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--output", type=str, default="./output_SA")
-parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_14_fixed.cgns")
+parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_15_fixed.cgns")
 parser.add_argument("--task", choices=["analysis", "polar"], default="analysis")
 args = parser.parse_args()
+outputDirectory = "./output_SA"
 
 comm = MPI.COMM_WORLD
-if not os.path.exists(args.output):
+if not os.path.exists(outputDirectory):
     if comm.rank == 0:
-        os.mkdir(args.output)
+        os.mkdir(outputDirectory)
 
 aeroOptions = {
     # I/O Parameters
     "gridFile": args.gridFile,
-    "outputDirectory": args.output,
+    "outputDirectory": outputDirectory,
     "monitorVariables": ["resrho", "resturb", "yplus"],
     "surfaceVariables": ["cf", "cfx", "cfy", "cfz", "p", "vx", "vy", "vz", "temp", "rho", "mach"], 
     # Added to enable Rohits' implementation of SA-Edwards: enables double precision and volume restart file
@@ -56,16 +62,57 @@ aeroOptions = {
     "turbulenceModel": "SA", # SA-Edwards will be implemented in the second stage
     "turbResScale": 1e5, # default
     # Solver Parameters
+    # 2w needs one coarsening. The grid is a single 700x200x2 block that ADflow
+    # cuts into nProc sub-blocks, and every cut has to stay 1-to-1 matching after
+    # coarsening or coarseUtils.F90:1528 aborts with "Non-matching block-to-block
+    # face". On this grid that only holds for nProc = 10 or 14 -- 4, 8 and 12 all
+    # abort. Use 14 (see the usage line above); it is also the physical core count.
     "MGCycle": "2w",
-    "MGStartLevel": 1,
+    # Start on the COARSE grid (level 2 = 350x100x1) and prolong to the fine grid.
+    # This is the single most important change for grid 15. Starting ANK on the
+    # fine grid straight from uniform freestream drives a near-wall cell
+    # unphysical on iteration 8 -- Y+_max jumps 9 -> 5297 -- and the line search
+    # then rejects every step forever (totalRes frozen at 6.03e8, above the 3.74e8
+    # it started from). The coarse grid has 4x fewer cells and a 2x larger first
+    # off-wall cell, so the startup transient is survivable there; the prolonged
+    # coarse solution is then a good enough initial guess that ANK takes 0.9-sized
+    # steps on the fine grid from iteration 1.
+    "MGStartLevel": 2,
     "nSubiter": 1, # how many checks before the next timestep is taken
-    "nSubiterTurb": 10,  # was 3; turbulence lags badly in segregated ANK at 3
-    "CFL": 1.5, # Value that directly affects timestep size
-    "CFLCoarse": 1.0, # Value that directly affects timestep size in coarse regions, usually lower than CFL 
+    "nSubiterTurb": 7,  # was 3; turbulence lags badly in segregated ANK at 3
+    # CFL/CFLCoarse drive the DADI smoother, NOT ANK (ANK has its own ANKCFL*).
+    # CFLCoarse is the live one here: it is what runs the level-2 startup, and
+    # 1.0 gets to totalRes 1.2e6 in 500 coarse cycles where 0.3 only reaches 1.1e7.
+    # CFL is fine-grid DADI, which with the settings below never actually runs --
+    # but keep it at 1.0, not 5.0: fine-grid DADI at CFL 5 from freestream NaNs on
+    # this grid in two iterations (totalRes 4.8e51 then NaN).
+    "CFL": 1.0,
+    "CFLCoarse": 1.0,
     # ANK Solver Parameters
     "useANKSolver": True,
-    "ANKSwitchTol": 1e10,
-    "ILUFill": 3, # Your steering system, eats up memory but controls your CFL/timesteps
+    # Switch tolerances are RELATIVE to the free-stream residual totalR0
+    # (solvers.F90:1107: `if (totalR > ANK_switchTol * totalR0) call executeMGCycle`).
+    # 1e11 is far above 1, so ANK owns the fine grid from its first iteration and
+    # the fine-grid DADI smoother is never used. That is deliberate -- see the CFL
+    # note above for what happens if it does run.
+    "ANKSwitchTol": 1e11,
+    # ANK's CFL sets the size of the I*V/(CFL*dt) term added to the diagonal of
+    # the Jacobian, i.e. how much the pseudo-transient continuation regularises
+    # the Newton step. ANKCFL0=5 (the default, and what grid 14 used) is too
+    # aggressive here: grid 15's first off-wall cell is 9.56e-7 m against grid
+    # 14's 1.60e-6 m, so the wall-normal Jacobian entries are stiffer and a
+    # near-Newton first step overshoots into unphysical territory. 1.0 gives
+    # enough regularisation to get started, and the ramp takes it back over 200
+    # within ~35 iterations anyway.
+    "ANKCFL0": 1.0,
+    # NB: the bare "ILUFill" option that used to sit here was a no-op. It maps to
+    # inputADjoint::fillLevel (pyADflow.py:6869) and is only read by the ADJOINT
+    # KSP setup in adjointAPI.F90:917 -- this script runs no adjoint, so it never
+    # did anything. The flow solvers have their own private copies below. ILU fill
+    # is the level-of-fill of the incomplete LU used as the *local* (per-subdomain)
+    # preconditioner inside additive Schwarz; it has no connection to CFL.
+    "ANKPCILUFill": 2,
+    "NKPCILUFill": 2,
     # Default ANK is segregated: it solves the mean flow implicitly and leaves
     # nuTilde to nSubiterTurb DADI sweeps. On this case that stalls -- res rho
     # drops 4 orders while res nuturb *climbs* (8.7e-6 -> 1.6e-3) and totalRes
@@ -124,7 +171,7 @@ CFDSolver(ap)
 funcs = {}
 CFDSolver.evalFunctions(ap, funcs)
  
-restartPath = os.path.join(args.output, f"{ap.name}_000_vol.cgns")
+restartPath = os.path.join(outputDirectory, f"{ap.name}_000_vol.cgns")
 if comm.rank == 0:
     print(funcs)
     print("=" * 50)
