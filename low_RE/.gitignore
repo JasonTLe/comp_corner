@@ -6,6 +6,7 @@ output_SA/*
 !meshes/comp_corner_14_fixed.cgns
 !meshes/comp_corner_20.cgns
 !meshes/comp_corner_20_fixed.cgns
+!meshes/comp_corner_20_surf.fmt
 
 # WSL alternate-data-stream junk
 *:Zone.Identifier
