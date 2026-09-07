@@ -2,10 +2,10 @@
 # Meshes and results live on disk / shared storage, not in git.
 meshes/*
 output_SA/*
-!output_SA/comp_corner_sa_000_surf.cgns
-!output_SA/comp_corner_sa_000_vol.cgns
 !meshes/comp_corner_14.cgns
 !meshes/comp_corner_14_fixed.cgns
+!meshes/comp_corner_20.cgns
+!meshes/comp_corner_20_fixed.cgns
 
 # WSL alternate-data-stream junk
 *:Zone.Identifier
