@@ -25,6 +25,49 @@ from cgnsutilities.cgnsutilities import (
 )
 
 
+def forceADFOutput():
+    """Make every subsequent cg_open(CG_MODE_WRITE) emit ADF, not HDF5.
+
+    CGNS files come in two on-disk flavours, ADF and HDF5, and cg_open picks
+    whichever the library was configured to default to. ADflow here links a
+    CGNS 4.2 built *without* HDF5
+
+        ldd $CGNS_HOME/lib/libcgns.so.4.2   ->   no libhdf5
+
+    so an HDF5 grid dies in readBlockSizes with the thoroughly unhelpful
+    "File ... could not be opened for reading" -- the file is there and
+    readable, the reader just cannot parse it. cgnsutilities writes through
+    this same libcgns, so flipping the library-global default here also
+    governs grid.writeToCGNS().
+
+    Belt and braces: harmless when libcgns is ADF-only (ADF is always
+    compiled in), and decisive when it is not.
+    """
+    lib = ctypes.CDLL("libcgns.so")  # same handle libcgns_utils.so already pulled in
+    lib.cg_get_error.restype = ctypes.c_char_p
+
+    CG_OK, CG_FILE_ADF = 0, 1
+    if lib.cg_set_file_type(CG_FILE_ADF) != CG_OK:
+        raise RuntimeError(f"cg_set_file_type(ADF) failed: {lib.cg_get_error().decode()}")
+
+
+def getFileType(fileName):
+    """Return "ADF" or "HDF5" for an existing CGNS file, from its magic bytes.
+
+    Deliberately not cg_is_cgns: on an ADF-only libcgns that call cannot parse
+    an HDF5 file at all (returns ier=1, type=0), so it reports "broken" exactly
+    where we most want it to report "HDF5". The magic bytes are build-agnostic.
+    """
+    with open(fileName, "rb") as f:
+        magic = f.read(8)
+
+    if magic.startswith(b"\x89HDF\r\n\x1a\n"):
+        return "HDF5"
+    if magic.startswith(b"\xc0\xa8\xa3\xa9"):
+        return "ADF"
+    return f"unrecognized ({magic!r})"
+
+
 def setSIUnits(fileName):
     """Stamp DataClass=Dimensional + DimensionalUnits=SI on every BCData_t node.
 
@@ -150,12 +193,23 @@ for blk in grid.blocks:
     for boco in blk.bocos:
         bcType = boco.internalType
         if bcType in famMap:
-            oldFam = getattr(boco, "family", None) or "<none>"
-            renameRows.append(
-                [blk.name, boco.name, bcType, f'"{oldFam}" --> "{famMap[bcType]}"']
-            )
-            boco.family = famMap[bcType]
-            nRenamed += 1
+            oldFam = getattr(boco, "family", None) or ""
+            # Only name a family that does not already have a real one.  A grid
+            # straight out of Pointwise (comp_corner_14) arrives with every BC
+            # on "default", and naming those is the whole point of this pass.
+            # mesh.py, though, writes a distinct family per face -- wall_plate
+            # vs wall_ramp, inflow vs outflow -- and since cgnsutilities throws
+            # the BC_t names away on write, those families are the only thing
+            # that keeps the faces separately addressable.  Collapsing them
+            # back onto one name per BC type would undo that.
+            if oldFam in ("", "default"):
+                boco.family = famMap[bcType]
+                renameRows.append(
+                    [blk.name, boco.name, bcType, f'"{oldFam or "<none>"}" --> "{boco.family}"']
+                )
+                nRenamed += 1
+            else:
+                renameRows.append([blk.name, boco.name, bcType, f'"{oldFam}" (kept)'])
         if bcType == "bcwallviscousisothermal":
             if Twall is None: 
                 raise ValueError("****ERROR: Dirichlet temperature must be provided.*****")
@@ -195,9 +249,17 @@ if fixedRows:
         )
     )
 
+forceADFOutput()
 grid.writeToCGNS(outFile)
 nUnits = setSIUnits(outFile)
+
+outType = getFileType(outFile)
+if outType != "ADF":
+    raise RuntimeError(
+        f"{outFile} was written as {outType}, not ADF -- ADflow's libcgns cannot read it."
+    )
 print("="*50)
 print(f"Tagged {nUnits} BCData node(s) with DataClass=Dimensional, units = SI (kg, m, s, K, rad)")
 print(f"Successfully renamed {nRenamed} BC(s) and fixed {nFixed} isothermal wall BC(s) --> {outFile}")
+print(f"Wrote {outType} CGNS (ADflow's libcgns is ADF-only; an HDF5 grid will not open)")
 print("="*50)

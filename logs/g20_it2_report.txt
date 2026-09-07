@@ -1,0 +1,28 @@
++--------------------+--------------------------------------------+
+| quantity           | value                                      |
++--------------------+--------------------------------------------+
+| grid (i x j)       | 1185 x 145                                 |
+| M_inf              | 2.950                                      |
+| ramp angle [deg]   | 25.00                                      |
+| Re [1/m]           | 2.799e+07                                  |
+| plate length [mm]  | 225.5                                      |
+| transition x [mm]  | none (fully turbulent)                     |
+| delta_0 [mm]       | 2.392                                      |
+| Re_tau             | 546                                        |
+| delta @ x_exp [mm] | 2.269  at x = -34.96 mm  (exp 2.27, -0.0%) |
+| Re_delta           | 63523  (exp 63560, -0.1%)                  |
+| Re_tau @ x_exp     | 521                                        |
+| x_sep [mm]         | -10.99                                     |
+| x_reatt [mm]       | 9.43                                       |
+| L_sep [mm]         | 20.42                                      |
+| L_sep / delta_0    | 8.54                                       |
+| p/p_inf peak       | 4.8369  (Cp = 0.6299)                      |
+| p/p_inf inviscid   | 4.8364  (Cp = 0.6298)                      |
+| beta fitted [deg]  | 43.18                                      |
+| beta theory [deg]  | 44.59                                      |
+| 1st cell [um]      | 0.40 - 0.40                                |
+| y+ min/mean/max    | 0.000 / 0.101 / 0.483                      |
+| T_w/T_inf          | 2.3795                                     |
+|   adiabatic theory | 2.5664                                     |
+| reverse-flow cells | 6317                                       |
++--------------------+--------------------------------------------+

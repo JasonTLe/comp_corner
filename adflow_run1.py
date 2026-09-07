@@ -14,16 +14,30 @@ fix_bc.py will implement the family names and any other BC data
 ==================================================
 
 STAGE 1 of 2 -- standard SA with ANK/NK to produce a converged restart file.
-Writes ./output/comp_corner_sa_vol.cgns in DOUBLE precision, which
-comp_corner_sa_edwards.py then reloads as its restartFile.
+Writes ./output_SA/comp_corner_sa_000_vol.cgns in DOUBLE precision, which
+adflow_run2.py then reloads as its restartFile.
 
-USAGE: mpiexec -n 14 python3.11 comp_corner_S1.py
+USAGE: mpiexec -n 16 python3 adflow_run1.py
 
-    nProc MATTERS. comp_corner_15_fixed.cgns is one 700x200x2 block; ADflow cuts
-    it into nProc pieces and every cut must survive multigrid coarsening. Only
-    nProc = 10 and 14 work with MGCycle "2w" on this grid (4/8/12 abort in
-    checkCoarse1to1). 14 is also the physical core count on this machine, so
-    anything above 14 is refused by OpenMPI for lack of slots.
+    nProc MATTERS. comp_corner_20_fixed.cgns is one 1185x145x3 node block, i.e.
+    1184x144x2 cells; ADflow cuts it into nProc pieces and every cut plane must
+    still land on a cell boundary after multigrid coarsening, i.e. at an even
+    cell index. Probed on this grid with MGCycle "2w": nProc = 8 and 16 work,
+    14 aborts in checkCoarse1to1 with "Non-matching block-to-block face".
+    Use 16.
+
+    16 is also the right number for the machine, and not because nproc says 32.
+    This host is an AMD Ryzen 9 7950X: 16 PHYSICAL cores, 32 threads. nproc
+    counts SMT siblings, which are not extra compute -- 16 ranks is one per
+    physical core, i.e. saturation, not headroom. Running 32 would put two
+    ranks on each core sharing one FP unit and one L2, which for a
+    bandwidth-bound solve is neutral at best; it is moot anyway, since
+    1184/32 = 37 is odd and would abort.
+
+    The counts are not an accident -- mesh.py picks its default point counts so
+    ni-1 factorises well, and prints the workable nProc list when it runs. The
+    earlier 550/220 defaults gave ni-1 = 926 = 2 x 463 with 463 prime, and
+    *every* nProc from 2 to 32 aborted, nProc = 2 included.
 
 """
 
@@ -35,7 +49,7 @@ from baseclasses import AeroProblem
 from mpi4py import MPI
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_15_fixed.cgns")
+parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_20_fixed.cgns")
 parser.add_argument("--task", choices=["analysis", "polar"], default="analysis")
 args = parser.parse_args()
 outputDirectory = "./output_SA"
@@ -60,6 +74,35 @@ aeroOptions = {
     "eddyVisInfRatio": 0.2104, # makes ~v/v = 3, default is 1.342; apparently affects the location of the transition
     "equationType": "RANS",
     "turbulenceModel": "SA", # SA-Edwards will be implemented in the second stage
+    # Drop the ft2 trip term -- i.e. run SA-noft2, which is what the NASA TMR
+    # calls the standard fully-turbulent form of the model.
+    #
+    # This is here for CONSISTENCY WITH STAGE 2, not just convention.  Stage 2
+    # runs SA-Edwards, and sa.F90:290-296 forces ft2 = 0 whenever useSAEdwards
+    # is set, *before* it ever looks at useft2SA:
+    #
+    #     if (useSAEdwards) then
+    #         ft2 = zero            <- Edwards drops ft2 by construction
+    #     else if (useft2SA) then
+    #         ft2 = rsaCt3 * exp(-rsaCt4 * chi2)
+    #
+    # So stage 2 has no ft2 whatever this option says.  Leaving it on here
+    # means stage 1 converges a *different model* from the one stage 2 then
+    # solves, and the restart carries a model discontinuity on top of the
+    # Edwards change that stage 2 has to unwind.  Turning it off here makes the
+    # two stages differ by the Edwards terms alone, which is the entire point
+    # of splitting them.
+    #
+    # It bites hardest exactly where this case lives.  ft2 = 1.2*exp(-0.5*chi^2)
+    # damps production while nuTilde is small, which is what "keeps a laminar
+    # solution laminar"; with eddyVisInfRatio tuned to chi = 3 the freestream
+    # ft2 is 0.013, small but not zero, and it is the mechanism behind the
+    # "affects the location of the transition" note on that option.
+    #
+    # Unlike saVariant, this one is NOT a blockette trap: useft2SA is read by
+    # both SA implementations -- sa.F90:293 (DADI path) and blockette.F90:1124
+    # (ANK/NK path) -- so it is honoured whatever useBlockettes is set to.
+    "useft2SA": False,
     "turbResScale": 1e5, # default
     # Solver Parameters
     # 2w needs one coarsening. The grid is a single 700x200x2 block that ADflow

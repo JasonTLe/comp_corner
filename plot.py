@@ -95,6 +95,7 @@ import matplotlib
 matplotlib.use('Agg')          # render to file; no display needed
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+import matplotlib.patheffects as pe
 
 GAM = 1.4                      # ratio of specific heats
 KARMAN, BLOG = 0.41, 5.2       # log-law constants
@@ -586,9 +587,12 @@ class ADFFile:
         self.f.seek(a); return self.f.read(n)
 
     def dp(self, a):
+        # An ADF disk pointer is 12 ASCII characters, not 12 binary bytes:
+        # 8 hex digits of block number followed by 4 hex digits of offset
+        # inside that block.  block 0 / offset BLOCK is the "unset" value.
         b = self.at(a, 12)
-        blk = struct.unpack(self.end+'Q', b[:8])[0]
-        off = struct.unpack(self.end+'I', b[8:])[0]
+        blk = int(b[:8], 16)
+        off = int(b[8:12], 16)
         v = blk*BLOCK + off
         return None if (blk == 0 and off == BLOCK) else v
 
@@ -602,7 +606,7 @@ class ADFFile:
         if b[:4] != b'NoDe' or b[242:246] != b'TaiL':
             raise ValueError('bad ADF node at %d' % a)
         nd = int(b[128:130], 16)
-        dims = [struct.unpack(self.end+'q', b[130+8*i:138+8*i])[0] for i in range(nd)]
+        dims = [int(b[130+8*i:138+8*i], 16) for i in range(nd)]   # ASCII hex, like everything else in the header
         return dict(addr=a,
                     name=b[4:36].decode('latin1').strip(),
                     label=b[36:68].decode('latin1').strip(),
@@ -958,8 +962,27 @@ class Case:
         self.delta_exp, self.Retau_exp, self.profile_exp = self.boundary_layer(X_EXP)
         self.Re_delta = self.Re_m*self.delta_exp
 
-        # Ramp angle: straight-line fit through the downstream quarter of the wall.
-        m = x > 0.25*x.max()
+        # Ramp angle: straight-line fit through the ramp, and the ramp ONLY.
+        #
+        # The old window was x > 0.25*x.max(), which is wrong whenever the mesh
+        # carries an inviscid slip wall past the ramp (mesh.py --invBackLength):
+        # x.max() is then the end of that horizontal wall, so the window spans
+        # the ramp AND the flat stretch behind it and one line through both
+        # returns the average.  On comp_corner_18 that is 16.40 deg for a
+        # geometrically exact 25 deg ramp.
+        #
+        # It is not a cosmetic error -- self.ramp is the wedge angle handed to
+        # oblique_shock_beta, so it also sets `beta theory` and the inviscid
+        # p/p_inf drawn as the dashed line on the wall-pressure panel.  At
+        # M = 2.95 the difference is beta 34.10 vs 44.59 deg and p/p_inf 3.025
+        # vs 4.836, i.e. the figure claimed the solution missed inviscid theory
+        # by 60% when it actually sits within 0.1% of it.
+        #
+        # The ramp runs from the compression corner up to the crest, so take
+        # the first node at max y as its downstream end and trim 5% off each
+        # end to drop the two kink cells, whose j-lines bisect the turn.
+        x_top = x[int(np.argmax(self.yw))]
+        m = (x > 0.05*x_top) & (x < 0.95*x_top)
         self.ramp = np.degrees(np.arctan(np.polyfit(x[m], self.yw[m], 1)[0]))
 
         self._fit_shock()
@@ -1197,8 +1220,14 @@ def figure_flowfield(case, fname, exag=3.5):
     vmax = np.ceil(case.Minf*10)/10
 
     fig = plt.figure(figsize=(13.4, 11.6))
+    # right=0.93, not 0.985.  Panels (a) and (b) are set_aspect('equal'), so
+    # their axes shrink to fit and their colorbars land inside the canvas
+    # whatever this is.  Panel (c) is vertically exaggerated and has no aspect
+    # constraint, so it fills the full width and pushes its colorbar -- ticks
+    # and the 'M' label -- off the right edge.  This is the margin that keeps
+    # the key on the page; it costs (c) a little width and (a)/(b) nothing.
     gs = GridSpec(3, 1, height_ratios=[1, 1, 1.7], hspace=0.30,
-                  left=0.07, right=0.985, top=0.955, bottom=0.05)
+                  left=0.07, right=0.93, top=0.955, bottom=0.05)
 
     # --- (a) Mach number ---------------------------------------------------
     ax = fig.add_subplot(gs[0])
@@ -1242,7 +1271,7 @@ def figure_flowfield(case, fname, exag=3.5):
     x0 = case.x_sep*MM - 9*d0
     x1 = case.x_rea*MM + 9*d0
     y_reatt = np.interp(case.x_rea, case.xw, case.yw)*MM
-    y0, y1 = -0.35*d0, y_reatt + 3.0*d0
+    y0, y1 = -0.95*d0, y_reatt + 3.0*d0
 
     pc = ax.pcolormesh(Xm, Ym, case.M, cmap='turbo', vmin=0, vmax=vmax,
                        shading='flat', rasterized=True)
@@ -1271,13 +1300,44 @@ def figure_flowfield(case, fname, exag=3.5):
                 ax.plot(P[:, 0]*MM, P[:, 1]*MM, color='0.1', lw=0.8, zorder=7)
 
     _draw_wall(case, ax, y0 - 3)
-    for xm, ym in [(case.x_sep*MM, np.interp(case.x_sep, case.xw, case.yw)*MM),
-                   (case.x_rea*MM, y_reatt)]:
+
+    # Separation and reattachment.  The letters sit next to their own markers
+    # rather than out in the free stream, on a dark patch so they read over
+    # whatever the colormap is doing there (R used to be white-on-cyan), and
+    # each one drops a dashed line to the axis carrying its x.  The dash
+    # pattern and the white halo keep these apart from the inviscid-shock line,
+    # which is also dashed and also white.
+    halo = [pe.withStroke(linewidth=3.0, foreground='w')]
+    y_sep = np.interp(case.x_sep, case.xw, case.yw)*MM
+    marks = [('S', case.x_sep*MM, y_sep,   -1),
+             ('R', case.x_rea*MM, y_reatt, +1)]
+    for tag, xm, ym, side in marks:
         ax.plot([xm], [ym], 'o', ms=7, mfc='none', mec='w', mew=1.8, zorder=10)
-    ax.text(case.x_sep*MM - 1.4*d0, 0.6*d0, 'S', color='w',
-            fontsize=12, weight='bold', zorder=11)
-    ax.text(case.x_rea*MM + 1.3*d0, y_reatt + 1.1*d0, 'R', color='w',
-            fontsize=12, weight='bold', zorder=11)
+        ax.plot([xm, xm], [y0, ym], color='0.1', lw=1.3, ls=(0, (5, 3)),
+                zorder=9.5, path_effects=halo)
+        # leader from the badge to the exact point, so the letter cannot be
+        # read as labelling whichever streamline it happens to sit on
+        ax.annotate(tag, xy=(xm, ym), xytext=(xm + side*0.85*d0, ym + 0.95*d0),
+                    color='w', fontsize=12, weight='bold', ha='center',
+                    va='center', zorder=11,
+                    bbox=dict(boxstyle='circle,pad=0.22', fc='0.1', ec='w', lw=1.2),
+                    arrowprops=dict(arrowstyle='-', color='w', lw=1.5,
+                                    shrinkA=3, shrinkB=5,
+                                    path_effects=[pe.withStroke(linewidth=3.0,
+                                                                foreground='0.1')]))
+        ax.text(xm, y0 + 0.08*d0, '%.2f' % xm, color='0.1', fontsize=9,
+                weight='bold', ha='center', va='bottom', zorder=12,
+                bbox=dict(boxstyle='round,pad=0.18', fc='w', ec='0.1', lw=0.8))
+
+    # Span between them, i.e. the separation length the title quotes.
+    y_span = y0 + 0.62*d0
+    ax.annotate('', xy=(case.x_sep*MM, y_span), xytext=(case.x_rea*MM, y_span),
+                arrowprops=dict(arrowstyle='<->', color='0.1', lw=1.3,
+                                shrinkA=0, shrinkB=0), zorder=11)
+    ax.text(0.5*(case.x_sep + case.x_rea)*MM, y_span + 0.06*d0,
+            r'$L_{sep}$ = %.2f mm' % (case.Lsep*MM), color='0.1', fontsize=9,
+            weight='bold', ha='center', va='bottom', zorder=11,
+            path_effects=halo)
     xl = np.array([0, (x1 - 0)*0.85])
     ax.plot(xl, np.tan(beta)*xl, color='w', ls=(0, (6, 4)), lw=1.3, zorder=8)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
@@ -1345,11 +1405,23 @@ def figure_wall(case, fname):
     ax.plot(xw, case.cfw, color='#0b6b3a', lw=2.0)
     ax.axhline(0, color='k', lw=1.0)
     ax.axvspan(xs, xr, color='#ffd9a0', alpha=.6, zorder=0)
-    top = 0.7*np.nanmax(case.cfw[np.abs(xw) < W])
-    for xx, txt, dx in [(xs, 'S  %.2f mm' % xs, -0.30*W), (xr, 'R  %.2f mm' % xr, 0.04*W)]:
-        ax.axvline(xx, color='crimson', lw=1.1, ls='--')
-        ax.text(xx + dx, top, txt, fontsize=9, color='crimson')
     ax.set_xlim(-40, 30); ax.set_ylabel('$C_f$ (wall-tangent)'); ax.grid(alpha=.25); ax.set_ylim(-0.002, 0.004)
+    # Label S and R against the Cf curve -- Cf = 0 is what *defines* them, so
+    # this is the panel where they mean something.
+    #
+    # Place them in axis fractions, not data units.  The old code put them at
+    # 0.7*max(Cf) over a window four bubble-lengths wide, which reaches onto the
+    # ramp where Cf recovers well past this panel's 0.004 limit: on
+    # comp_corner_18 that is y = 0.0087, twice the top of the axes.  Matplotlib
+    # does not clip text by default, so the two labels were drawn outside this
+    # panel and landed on top of the wall-pressure panel above -- which is why
+    # S and R appeared to belong to p/p_inf.  get_xaxis_transform() keeps x in
+    # data coordinates and y in axis fractions, so they cannot escape again.
+    for xx, txt, dx, ha in [(xs, 'S  %.2f mm' % xs, -1.5, 'right'),
+                            (xr, 'R  %.2f mm' % xr, 1.5, 'left')]:
+        ax.axvline(xx, color='crimson', lw=1.1, ls='--')
+        ax.text(xx + dx, 0.90, txt, fontsize=9, color='crimson', ha=ha,
+                va='center', transform=ax.get_xaxis_transform())
     ax.set_title('(b)  Skin friction  —  L$_{sep}$ = %.2f mm = %.1f δ$_0$'
                  % (case.Lsep*MM, case.Lsep/case.delta0), loc='left', fontsize=10.5, pad=5)
 

@@ -40,16 +40,20 @@ state; the two checks are OR'd (line 1761).
 USAGE:
     BE CAREFUL WITH THE NUMBER OF PROCS YOU USE. COARSENING DOES NOT ALLOW A CERTAIN AMOUNT OF PROCS DUE TO UNEVEN SPLIT
 
-    For comp_corner_15_fixed.cgns (one 700x200x2 block) that means nProc = 10 or
-    14 only. 4, 8 and 12 all abort in coarseUtils.F90:1528 with "Non-matching
-    block-to-block face" because the sub-block cuts stop being 1-to-1 after the
-    "2w" coarsening. 14 is also the physical core count on this machine.
+    For comp_corner_20_fixed.cgns (one 1185x145x3 node = 1184x144x2 cell block)
+    that means nProc = 8 or 16; 14 aborts in coarseUtils.F90:1528 with
+    "Non-matching block-to-block face" because the sub-block cuts stop being
+    1-to-1 after the "2w" coarsening. Use 16, the same as stage 1 -- it is also
+    one rank per physical core on this host (see stage 1's header).
     Multigrid matters more here than in stage 1: stage 2 is a pure DADI run, so
     the coarse level is doing real work rather than sitting unused.
 
-    mpiexec -n 14 python3.11 comp_corner_S2.py \
-        --gridFile ./meshes/comp_corner_15_fixed.cgns \
+    mpiexec -n 16 python3 adflow_run2.py \
+        --gridFile ./meshes/comp_corner_20_fixed.cgns \
         --restartFile ./output_SA/comp_corner_sa_000_vol.cgns
+
+    Runtime at these settings, 16 ranks: stage 1 ~430 s, stage 2 ~4000 s (it
+    runs the full --nCycles; see the note on useANKSolver).
 """
 
 import argparse
@@ -60,12 +64,22 @@ from baseclasses import AeroProblem
 from mpi4py import MPI
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_15_fixed.cgns")
+parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_20_fixed.cgns")
 parser.add_argument(
     "--restartFile",
     type=str,
     default="./output_SA/comp_corner_sa_000_vol.cgns",
-    help="Double-precision volume CGNS written by comp_corner_sa.py",
+    help="Double-precision volume CGNS written by adflow_run1.py",
+)
+parser.add_argument(
+    "--nCycles",
+    type=int,
+    default=40000,
+    help="DADI cycle budget. This stage stops on the residual floor, not on "
+         "L2Convergence (see the note on useANKSolver), so this is what "
+         "actually ends the run. Lower it only for calibration sweeps, and "
+         "check res rho has plateaued at whatever value you pick -- res nuturb "
+         "floors early and totalRes hides res rho behind it.",
 )
 args = parser.parse_args()
 outputDirectory = "./output_SAE"
@@ -76,7 +90,7 @@ if comm.rank == 0 and not os.path.exists(outputDirectory):
 comm.barrier()
 
 if not os.path.isfile(args.restartFile):
-    raise FileNotFoundError(f"restartFile not found: {args.restartFile}. Run comp_corner_S1.py first.")
+    raise FileNotFoundError(f"restartFile not found: {args.restartFile}. Run adflow_run1.py first.")
 
 aeroOptions = {
     # I/O Parameters
@@ -93,6 +107,20 @@ aeroOptions = {
     "equationType": "RANS",
     "turbulenceModel": "SA",  # must stay "SA" (turbmodel=2) or nothing happens
     "saVariant": "SA-Edwards",  # knob to turn on edwards
+    # Set for the record, and to match stage 1 -- but note it changes NOTHING
+    # here. sa.F90:290-296 tests useSAEdwards first and forces ft2 = 0 before it
+    # ever reaches the useft2SA branch:
+    #
+    #     if (useSAEdwards) then
+    #         ft2 = zero
+    #     else if (useft2SA) then
+    #         ft2 = rsaCt3 * exp(-rsaCt4 * chi2)
+    #
+    # Edwards drops ft2 by construction, so this stage was already running
+    # noft2 whether or not the option was present. Where it does matter is
+    # stage 1 -- see the long note on useft2SA there. Keep the two files in
+    # step so the only difference between the stages is the Edwards terms.
+    "useft2SA": False,
     "turbResScale": 1e5,  
     # Solver Parameters -- DADI
     "smoother": "DADI", # default
@@ -149,16 +177,26 @@ aeroOptions = {
     # stall, not a budget problem: a control run of 400 further DADI cycles from
     # that state moved totalRes only 4.6410e-03 -> 4.6325e-03.
     #
-    # So DADI still does the settling-in that this stage exists for -- the
-    # Edwards source term fires on cycle 1 and throws the residual to ~8.2e+04,
-    # and the smoother walks that back down -- but NK is handed the endgame.
-    # NKSwitchTol 1e-6 means NK takes over at totalRes = 1e-6 * totalR0 = 374,
-    # which DADI reaches around cycle 4000, long after the source term has
-    # settled. ANK stays off: it is segregated here, so its turbulence update is
-    # the same DADI that is stalling, and it would not touch the floor.
+    # This stage is DADI ONLY. Both Newton solvers are off.
+    #
+    # That is a deliberate restriction and it has a known cost: on grid 15 DADI
+    # drove the mean flow to res rho 4.4e-10 but res nuturb floored at ~8.8e-11,
+    # pinning totalRes at 4.64e-03 against a 3.74e-04 target, and 400 further
+    # cycles from that state moved it only 4.6410e-03 -> 4.6325e-03. That is a
+    # genuine stall, not a budget problem, and the earlier version of this file
+    # handed the endgame to NK at NKSwitchTol 1e-6 for exactly that reason.
+    #
+    # With NK off, expect this stage to run to nCycles and stop on the residual
+    # floor rather than on L2Convergence. The Edwards field is still solved
+    # correctly -- DADI goes through sa.F90, which is the implementation that
+    # has the Edwards terms -- so the physics is right; it is the last two or
+    # three orders of residual that DADI cannot deliver on its own. Judge the
+    # result on the nuTilde check and the residual history, not on the exit code.
+    #
+    # If NK is ever switched back on here, useBlockettes MUST stay False (see
+    # the block above) or ANK/NK will silently solve standard SA instead.
     "useANKSolver": False,
-    "useNKSolver": True,
-    "NKSwitchTol": 1e-6,
+    "useNKSolver": False,
     # Termination Criteria
     # L2Convergence is measured against the FREE-STREAM residual. On
     # comp_corner_15_fixed that is totalR0 = 3.74e8 (grid 14 was 1.947e8), so
@@ -174,10 +212,10 @@ aeroOptions = {
     # It is left on only as a harmless OR'd backstop.
     "L2Convergence": 1e-12,
     "L2ConvergenceRel": 1e-8,
-    "nCycles": 40000,
+    "nCycles": args.nCycles,
 }
 
-# Must match comp_corner_sa.py exactly.
+# Must match adflow_run1.py exactly.
 ap = AeroProblem(
     name="comp_corner_sa_edwards",
     mach=2.95,
