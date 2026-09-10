@@ -8,6 +8,41 @@ Generate a 25-deg compression-corner volume mesh with the MDO Lab toolchain
 extrusion).  The viscous part of the geometry and the point distribution come
 from meshes/comp_corner_14_fixed.cgns, which was hand-built in Pointwise.
 
+THIS COPY IS THE highRe CASE (M = 2.88, Re_delta = 132 840, delta = 4.1 mm at
+8.04 delta upstream of the corner -- see flow_conditions.py).  It is low_RE/
+mesh.py with every length that carries a boundary-layer scale multiplied by
+
+    k = delta_highRe / delta_lowRe = 4.10 / 2.27 = 1.8062
+
+and the point counts adjusted to hold the same cells-per-delta, so the two
+grids resolve their own boundary layers identically and a difference between
+the two solutions is a Reynolds-number difference and not a mesh difference.
+The code below is UNCHANGED from low_RE/mesh.py; only the argparse defaults
+and the notes on them differ.  Summary of what moved:
+
+    option            lowRe        highRe    why
+    --invFrontLength  0.05         0.09      k, holds the same stretching ratio
+    --plateLength     0.1759264    0.321360  recalibrated (3 solves), see its note
+    --rampLength      0.04         0.04      NOT scaled: the paper plots both
+                                             cases over the same x/L window
+                                             (fig. 2 reaches x/L = +30 highRe)
+    --invBackLength   0.02         0.036     k
+    --nPlate          808          874       ds 218 -> 368 um, ~11.1 cells/delta
+    --nRamp           220          122       ds 202 -> 365 um, ~11.2 cells/delta
+    --nInvFront       109          109       length/ds is unchanged, so is the
+    --nInvBack        51           51        stretching each has to do
+    --N               145          157       12 more layers to span the taller
+                                             march at the same outer ratio
+    --s0              8.0e-7       8.0e-7    NOT scaled -- y+ is set by s0 and
+                                             would rise with it; see the note
+    --marchDist       0.0285977    0.0516    k
+    --wnFineHeight    0.0035       0.0063    k, still ~1.54 delta
+    --output          ..._20.cgns  ..._21.cgns
+
+meshes/comp_corner_20*.cgns in this directory are STALE COPIES of the lowRe
+grid left over from the repository reorganisation.  They are calibrated to
+delta = 2.27 mm and must not be used here; comp_corner_21 is this case's grid.
+
 The wall, upstream to downstream, is four segments with three adjustable
 lengths (--invFrontLength, --plateLength, --invBackLength; the ramp has its
 own --rampLength):
@@ -29,7 +64,8 @@ so cell size is continuous across each junction and only the BC changes.
 Setting either inviscid length to 0 drops that segment; with both at 0 the
 geometry is comp_corner_14's exactly.
 
-Reference distribution, from comp_corner_14_fixed.cgns:
+Reference distribution, from comp_corner_14_fixed.cgns (the lowRe ancestor
+of this geometry -- kept verbatim because it is what the code reproduces):
     i : flat plate  x in [-0.125758, 0.0], 550 pts, uniform
         25 deg ramp x in [0.0, 0.04],      220 pts, uniform in x
         (junction nodes are shared, so ni = sum(counts) - #junctions)
@@ -87,7 +123,7 @@ outflow and outer into one "farfield".  It now only names a family that is
 still "default", so a Pointwise grid like comp_corner_14 still gets ADflow's
 auto-generated names and these stay as written.
 
-Inflow and outflow are both bcfarfield, as requested: at Mach 2.95 (the
+Inflow and outflow are both bcfarfield, as requested: at Mach 2.88 (the
 free-stream both adflow_run1.py and adflow_run2.py set) the upstream face is
 supersonic inflow and the downstream one supersonic outflow, and
 ADflow's farfield picks which from the local Riemann invariants rather than
@@ -353,10 +389,11 @@ def marchRatios(N, s0, marchDist, r0, yFine, nBlend):
                 spans exactly `marchDist`
 
     yFine is a height, not a layer count, so it stays meaningful when s0 or N
-    move: 3.5 mm is ~1.5x the 2.27 mm boundary layer at the reference station,
-    which keeps the layer itself, the separation bubble and the near-wall half
-    of the interaction inside the fine region.  At N = 145 that is 114 of the
-    144 layers at r0, and r1 comes out ~1.108.
+    move: on this highRe grid 6.3 mm is ~1.54x the 4.1 mm boundary layer at the
+    reference station, which keeps the layer itself, the separation bubble and
+    the near-wall half of the interaction inside the fine region.  At N = 157
+    that is 127 of the 156 layers at r0, and r1 comes out ~1.110 -- the same
+    outer ratio the lowRe grid ran at (3.5 mm / N = 145 / 114 of 144 / 1.108).
 
     Returns (ratios, nFine, r1).  `ratios` is the length N-1 list pyHyp wants:
     _expandPerLayerOption writes it to growthRatios[1:] and _computeDeltaS then
@@ -404,7 +441,7 @@ def marchRatios(N, s0, marchDist, r0, yFine, nBlend):
 
 
 def runPyHyp(surfaceFile, volumeFile, N, s0, marchDist, volBlend=1e-4,
-             wnRatio=1.048, wnFineHeight=0.0035, wnBlend=10):
+             wnRatio=1.048, wnFineHeight=0.0063, wnBlend=10):
     ratios, nFine, r1 = marchRatios(N, s0, marchDist, wnRatio, wnFineHeight, wnBlend)
     print(f"  wall-normal: {wnRatio:.4f} for {nFine} layers (to {wnFineHeight*1e3:.1f} mm), "
           f"blended over {wnBlend} to {r1:.4f} for the remaining "
@@ -520,7 +557,7 @@ def runPyHyp(surfaceFile, volumeFile, N, s0, marchDist, volBlend=1e-4,
 
 
 def extrudeVolume(surfaceFile, volumeFile, N, s0, marchDist, volBlend=1e-4,
-                  wnRatio=1.048, wnFineHeight=0.0035, wnBlend=10, tol=1e-3, maxIter=5):
+                  wnRatio=1.048, wnFineHeight=0.0063, wnBlend=10, tol=1e-3, maxIter=5):
     """Extrude to a wall-to-outer distance of `marchDist`, for real.
 
     pyHyp's own marchDist is a request, not a result, and volBlend (see above)
@@ -599,7 +636,7 @@ def setBCs(volumeFile, wallSegments):
     faces = [(fam, bcType, [[i1, i2], [1, 1], [1, nk]])
              for fam, bcType, i1, i2 in wallSegments]
     faces += [
-        # inflow and outflow are both farfield: at Mach 2.95 the upstream face
+        # inflow and outflow are both farfield: at Mach 2.88 the upstream face
         # is supersonic inflow and the downstream one is supersonic outflow, and
         # ADflow's farfield BC picks which it is from the local Riemann
         # invariants rather than needing to be told.  Naming them separately
@@ -653,47 +690,126 @@ def checkMultigrid(dims):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     # --- the three wall lengths, upstream to downstream --------------------
-    parser.add_argument("--invFrontLength", type=float, default=0.05,
+    # 0.09 m = lowRe's 0.05 x k.  Scaled because it is a stretched run-out from
+    # the plate's own spacing, and the plate's spacing scaled: what matters is
+    # length/ds, which stays at ~230 over 108 cells and so keeps the stretching
+    # ratio at ~1.013 (see --nInvFront).
+    parser.add_argument("--invFrontLength", type=float, default=0.09,
                         help="inviscid slip wall ahead of the plate [m]; 0 disables it")
-    # Calibrated, not inherited.  The boundary layer starts at the slip/no-slip
-    # junction at x = -plateLength, so this length alone sets how much running
-    # length the layer has when it reaches the experiment's measuring station at
-    # x = -15.4*delta = -34.958 mm.  Lengthening the *inviscid* run-in instead
+    # THE calibrated quantity, and the one thing in this file that cannot be
+    # scaled from low_RE by a factor.  The boundary layer starts at the
+    # slip/no-slip junction at x = -plateLength, so this length alone sets how
+    # much running length the layer has when it reaches the experiment's
+    # measuring station, which for the highRe case is
+    #
+    #     x_exp = -8.04 * 4.1 mm = -32.964 mm
+    #
+    # (vs the lowRe case's -15.4 * 2.27 = -34.958 mm -- the two experiments
+    # measured at nearly the same physical place, which is a coincidence and
+    # not something to lean on).  Lengthening the *inviscid* run-in instead
     # would do nothing -- it carries no boundary layer.
     #
-    # 0.1759264 m puts stage 2 (SA-Edwards, the reported case) on
-    # delta = 2.269999 mm against Hao (JFM 2023, 971 A28) low-Re case's 2.27 mm,
-    # i.e. -1 nm, with Re_delta = 63538 against 63560 (-0.03%).  Measured on
-    # comp_corner_20 at nProc 16, both stages run to their residual floors.
+    # Target: delta = 4.1 mm at x_exp, which then gives Re_delta = 132 840
+    # automatically, because flow_conditions.py has already pinned
+    # Re_m = 132840/4.1e-3 = 3.240e7 /m.  delta and Re_delta are ONE target,
+    # not two.
     #
-    # Note delta and Re_delta are one target, not two: adflow_run1.py already
-    # pins Re_m = 63560/2.27e-3 = 2.799e7 /m through mach/reynolds/
-    # reynoldsLength, so Re_delta = Re_m*delta follows once delta is right.
+    # ---- 0.321360 m is CALIBRATED ------------------------------------------
+    # Converged on comp_corner_21 at nProc 16, measured on the stage-2
+    # (SA-Edwards) surface, both stages run to their residual floors:
     #
-    # It is calibrated PER GRID and per stage.  The layer's virtual origin moves
-    # with the streamwise resolution at the junction, so --leRefine, --nPlate and
-    # the inviscid counts all shift it: comp_corner_19 (--leRefine 4) reads
-    # delta = 2.259 mm at this grid's calibrated length, -0.5%.  Recalibrate
-    # after any change to the wall distribution.
+    #   delta    = 4.099968 mm  against 4.100  (-32 nm, -0.001%)
+    #   Re_delta = 132 796      against 132 840 (-0.03%)
     #
-    # To recalibrate, take delta at full precision -- plot.py's table rounds to
-    # 3 decimals, which is coarser than the target:
+    # i.e. the same standard low_RE/ is held to (2.269999 mm, -1 nm, -0.03%).
     #
-    #   c = plot.Case("output_SAE/comp_corner_sa_edwards_000_surf.cgns")
+    # It took three solves, and the seed is worth recording because it is what
+    # a reader would otherwise recompute: the lowRe anchor pushed through
+    # delta = C * L_run^0.8 * Re_m^-0.2, with C fitted on the converged lowRe
+    # result rather than taken as the textbook 0.37,
+    #
+    #   C = 2.27e-3 / (0.140968^0.8 * (2.800e7)^-0.2) = 0.33581   (0.908*0.37)
+    #   L_run = (4.1e-3 / (C * (3.240e7)^-0.2))^1.25 = 0.30612 m
+    #   plateLength = L_run + 32.964 mm             = 0.33909 m
+    #
+    # seeds 339.09 mm and is 5.4% THICK.  Extrapolating 1.8x in delta and 1.16x
+    # in Re_m off one anchor on another grid does not work; the converged C here
+    # is 0.35459, not the lowRe grid's 0.33581.  Do not trust the seed formula
+    # for a third case either -- use it to start, then iterate.
+    #
+    # If flow_conditions.MATCH is switched to "rho" (Re_m = 2.8595e7 /m instead
+    # of 3.2400e7), THIS NUMBER IS WRONG: a different Re_m grows a different
+    # layer over the same plate.  Rescaling the converged result rather than the
+    # seed, delta ~ Re_m^-0.2 at fixed L_run gives 4.100*(2.8595/3.2400)^-0.2 =
+    # 4.205 mm, so L_run would step to 288.396*(4.100/4.205)^(1/0.8823) =
+    # 280.35 mm, i.e. --plateLength 0.31332 m as the STARTING guess.  Calibrate
+    # it properly and record the result here next to this one.
+    #
+    # ---- how to calibrate ---------------------------------------------------
+    # Calibrate PER GRID and per stage: the layer's virtual origin moves with
+    # the streamwise resolution at the junction, so --leRefine, --nPlate and the
+    # inviscid counts all shift it.  Take delta at full precision -- plot_flow's
+    # table rounds to 3 decimals, coarser than the target:
+    #
+    #   import plot_flow
+    #   c = plot_flow.Case("output_SAE/comp_corner_sa_edwards_000_surf.cgns")
     #   c.delta_exp, c.Re_delta
     #
     # then step on the LOCAL exponent of delta ~ L_run^n, where L_run is
-    # plateLength - 34.958 mm.  Fitted on this grid from two converged runs:
+    # plateLength - 32.964 mm.  The lowRe grid fitted n = 0.693 over its own
+    # two converged runs (L_run 140.6250 -> delta 2.266168 mm, 140.9180 ->
+    # 2.269438 mm).  n is a local slope, not a constant: the lowRe grid had
+    # earlier been fitted at 0.847 on a different distribution, and using that
+    # value overshot each step by ~9 um of plate.  So use 0.693 for the FIRST
+    # step here, then refit from this grid's own two points -- L_run is 2.2x
+    # longer and the exponent has no obligation to have come along.
     #
-    #   L_run 140.6250 mm -> delta 2.266168 mm
-    #   L_run 140.9180 mm -> delta 2.269438 mm      n = 0.693
+    #   L_run_new = L_run_old * (delta_target / delta_measured)^(1/n)
     #
-    # NOT the 0.847 an earlier grid was fitted at -- that value overshoots the
-    # step by ~9 um of plate here, which is a whole 77-minute iteration wasted.
-    parser.add_argument("--plateLength", type=float, default=0.1759264,
+    # ---- measured -----------------------------------------------------------
+    #   L_run [mm]   delta [mm]   Re_delta   err       stage  n used for the step
+    #   ----------   ----------   --------   -------   -----  -------------------
+    #   306.036       4.527699     146 650   +10.43%     1     (preview only)
+    #   306.036       4.320498     139 939    +5.38%     2     0.8, correlation
+    #   286.639       4.077953     132 083    -0.54%     2     0.8823, fitted
+    #   288.396       4.099968     132 796    -0.001%    2     <- CONVERGED
+    #
+    # Three things to read off that table.
+    #
+    # 1. CALIBRATE ON STAGE 2, and do not shortcut it with stage 1.  The same
+    #    grid and the same free stream give delta = 4.5277 mm under SA-noft2 and
+    #    4.3205 mm under SA-Edwards -- 4.8% apart, which is most of the error
+    #    being chased.  Stage 1 is worth running as an ~11-minute preview of
+    #    whether a step went the right way; it is not the number.
+    #
+    # 2. THE LOCAL EXPONENT IS 0.8823 ON THIS GRID, fitted from the two stage-2
+    #    points at L_run 306.036 and 286.639.  Not the 0.8 of the flat-plate
+    #    correlation, and emphatically not the 0.693 the lowRe grid fitted --
+    #    that value would have overshot the second step by 1.8 mm of plate, i.e.
+    #    one wasted 85-minute iteration.  n is local to the grid, the Reynolds
+    #    number and the turbulence model; refit it, do not inherit it.
+    #
+    # 3. The first step, taken at the correlation's 0.8 because only one point
+    #    existed, overshot from +5.38% to -0.54%.  That overshoot is what made
+    #    the fit possible, so it was not wasted -- but it is why the seed
+    #    formula is documented above as a starting point and nothing more.
+    #
+    # calibrate.py does this arithmetic and carries the same table in HISTORY;
+    # run it against a converged stage-2 surface rather than doing it by hand.
+    parser.add_argument("--plateLength", type=float, default=0.321360,
                         help="viscous flat plate, from the slip wall to the corner [m]")
-    parser.add_argument("--invBackLength", type=float, default=0.02,
+    # 0.036 m = lowRe's 0.02 x k, for the same length/ds reason as
+    # --invFrontLength: 0.036/0.3648 mm = 98.7 against lowRe's 0.02/0.2015 mm
+    # = 99.3, so the same 50 cells do the same stretching.
+    parser.add_argument("--invBackLength", type=float, default=0.036,
                         help="inviscid slip wall past the ramp, horizontal [m]; 0 disables it")
+    # NOT scaled by k, unlike every other length here.  The ramp is not sized by
+    # delta, it is sized by where the interaction has to be resolved out to, and
+    # Hao plots both cases over the same window: figure 3 runs x/L = -40 .. +20
+    # for both, and figure 2 reaches x/L = +30 for the highRe case (L = 1 mm).
+    # 0.04 m of x carries the ramp to x/L = +40, past both.  The highRe bubble
+    # is longer than the lowRe one, but it grows UPSTREAM onto the plate, which
+    # is where the extra 163 mm of --plateLength already went.
     parser.add_argument("--rampLength", type=float, default=0.04, help="ramp, in x [m]")
     parser.add_argument("--angleDeg", type=float, default=25.0)
     # --- point counts per segment (junction nodes shared) ------------------
@@ -725,46 +841,114 @@ def main():
     # for 32 cells, i.e. 0.8% of the mesh, and that is the better trade: the
     # farfield standoff is a modelling choice and should not follow ds_i.
     #
-    # 109/51 puts ni-1 at 109+808+220+51-4 = 1184 = 2^5 x 37, which splits into
-    # equal even pieces at nProc = 8 and 16 -- 16 is what adflow_run1.py uses,
-    # and it is verified to partition.  See checkMultigrid.
+    # Unchanged at 109 from the lowRe grid, and for the reason in the table
+    # above: the run-in is 1.8x longer but it starts from a 1.8x coarser plate
+    # spacing, so length/ds is 0.09/0.3681 mm = 244.5 against lowRe's
+    # 0.05/0.2180 mm = 229.4.  The same 108 cells therefore do the same job at
+    # very nearly the same ratio -- 1.01289 measured here against lowRe's
+    # 1.013; scaling the count as well would have refined the run-in for no
+    # reason.
+    #
+    # 109/51 puts ni-1 at 109+874+122+51-4 = 1152 = 2^7 x 9, which splits into
+    # equal even pieces at nProc = 8, 16 and 32 -- 16 is what adflow_run1.py
+    # uses, and 1152/16 = 72 is even.  (lowRe's was 1184 = 2^5 x 37.)  See
+    # checkMultigrid.
     parser.add_argument("--nInvFront", type=int, default=109)
-    # 808 holds the plate's spacing at ~0.218 mm (comp_corner_14 used 0.229 mm
-    # over its shorter plate).  Unchanged from the refined mesh: this is the
-    # resolution the boundary layer actually gets, and none of the savings here
-    # come out of it.
-    parser.add_argument("--nPlate", type=int, default=808)
-    parser.add_argument("--nRamp", type=int, default=220)
+    # 874 holds the plate's spacing at 0.3681 mm over the calibrated 0.32136 m
+    # plate, i.e. 4.1/0.3681 = 11.1 cells per delta against the lowRe grid's
+    # 2.27/0.218 = 10.4.  That is the invariant being held: cells per delta, not
+    # cells per millimetre.  Scaling 808 by the plate-length ratio instead
+    # (808 x 0.3214/0.1759 = 1476) would have resolved the highRe layer 1.7x
+    # finer than the lowRe one and made the two solutions incomparable at 1.7x
+    # the cost.
+    #
+    # It also lands the plate's spacing within 1% of the ramp's 0.3648 mm, so
+    # the corner is very nearly a spacing-continuous junction -- better than the
+    # lowRe grid managed (0.218 vs 0.2015 mm, 8% apart).
+    #
+    # It also has to land ni-1 on a multigrid-friendly number.  ni-1 =
+    # nPlate + 278 (see --nInvFront), and the nearest multiples of 32 to the
+    # 861 the resolution target alone wants are 842 (ni-1 = 1120) and 874
+    # (ni-1 = 1152); 874 is the one that keeps ds under the lowRe grid's
+    # cells-per-delta rather than over it.
+    #
+    # NOTE this count is fixed while --plateLength is being calibrated, so ds
+    # drifts a little with each step: it ran 0.3883 -> 0.3661 -> 0.3681 mm over
+    # the three solves.  That is deliberate -- changing the count mid-calibration
+    # moves the virtual origin and invalidates the exponent fit.
+    parser.add_argument("--nPlate", type=int, default=874)
+    # 122, down from 220, because --rampLength did NOT scale while delta did.
+    # dx = 0.04/121 = 0.3306 mm, arc ds = dx/cos(25 deg) = 0.3648 mm, i.e.
+    # 4.1/0.3648 = 11.2 cells per delta against the lowRe grid's
+    # 2.27/0.2015 = 11.3.  Same resolution of the same physics, fewer points,
+    # because the physics is 1.8x bigger over the same 40 mm of ramp.
+    parser.add_argument("--nRamp", type=int, default=122)
     parser.add_argument("--nInvBack", type=int, default=51)
     # s0 alone sets y+; N only decides what the march costs to get from s0 to
     # the outer boundary.  comp_corner_14's 1.6e-6 m left the first cell centre
     # at 0.80 um, y+ ~ 0.20 along the plate but spiking to 0.95 (leading edge)
     # and 0.98 (ramp crest) at the two slip/no-slip junctions, where the wall
     # shear is largest.  y+ scales linearly with s0 and nothing else here does,
-    # so 8.0e-7 halves both the spikes and the mean and is kept as it was.
+    # so 8.0e-7 halves both the spikes and the mean.
     #
-    # N is 145, not 161, because the march no longer runs at one ratio.  161
-    # was what a single ratio cost to hold 1.048 all the way to the farfield;
-    # marchRatios holds 1.048 only where it buys resolution -- out to 3.5 mm,
-    # ~1.5x the boundary layer -- and lets the freestream above it grow at
-    # ~1.108.  The near-wall distribution is bit-identical to the 161-point
-    # mesh's (same s0, same 1.048, 104 cells below delta); the 16 points come
-    # entirely off the top, where the largest cell goes 1.30 -> 2.55 mm.
+    # s0 is the ONE length in this file that is deliberately NOT scaled by k.
+    # Scaling it would scale y+ straight up with it, and y+ is the quantity the
+    # value was chosen to hold.  It does not stay put by itself either:
+    # y+ ~ s0 * V * sqrt(cf) / nu, and going lowRe -> highRe (at MATCH = "Re")
     #
-    # 144 cells stay even through two coarsenings (144 -> 72 -> 36), which is
+    #   nu   = mu/rho  2.195e-5 -> 1.909e-5   (x0.870, rho is 22% higher)
+    #   V                614.6  ->    618.6   (x1.007)
+    #   sqrt(cf) at the calibrated station    (x0.912, Re_x 3.9e6 -> 9.9e6)
+    #
+    # nets to y+ x1.055 at the same s0.  A 5.5% rise off ~0.2 is nothing; a
+    # 1.8x rise off it would not be.  Leave s0 alone.  (At MATCH = "rho" the
+    # density is the quoted 0.368 instead of 0.417, nu is 2.163e-5, and y+ comes
+    # out slightly BELOW the lowRe grid's.)
+    #
+    # N is 157, up from the lowRe grid's 145, purely to span the 1.8x taller
+    # march at the same outer growth ratio.  marchRatios holds --wnRatio 1.048
+    # out to --wnFineHeight and solves for whatever outer ratio r1 still reaches
+    # --marchDist, so N is chosen by asking which value reproduces the lowRe
+    # grid's r1:
+    #
+    #     N    r1       largest cell    cells below delta
+    #    145  1.3044      10.47 mm            117
+    #    149  1.2019       7.67 mm            117
+    #    153  1.1451       5.88 mm            117
+    #    157  1.1098       4.68 mm            117    <- here
+    #    161  1.0860       3.82 mm            117
+    #   (lowRe: N = 145, r1 = 1.1078, 2.55 mm, 104 cells below delta)
+    #
+    # 157 lands r1 = 1.1098 against lowRe's 1.1078, and its largest cell is
+    # 4.68/2.55 = 1.83x the lowRe grid's, i.e. k.  The same mesh, 1.8x bigger.
+    # 117 cells below delta rather than 104 is the one place this grid is
+    # RICHER than its ancestor, and it is the direct consequence of holding s0
+    # fixed while delta grew -- free resolution, not a design choice.
+    #
+    # 156 cells stay even through two coarsenings (156 -> 78 -> 39), which is
     # what ADflow's "2w" cycle needs.
-    parser.add_argument("--N", type=int, default=145, help="wall-normal points")
+    parser.add_argument("--N", type=int, default=157, help="wall-normal points")
     parser.add_argument("--s0", type=float, default=8.0e-7, help="first cell height [m]")
     # 0.0285977 m is comp_corner_14's actual wall-normal march: the distance
     # from wall to outer boundary measured along the first inflow grid line.
     # (The 0.029-0.047 m in the header is the *y* range of the outer face,
     # which is larger only because the ramp lifts its downstream half.)
-    parser.add_argument("--marchDist", type=float, default=0.0285977, help="wall-normal march distance [m]")
+    # 0.0516 m = lowRe's 0.0285977 x k, i.e. the same 12.6 delta of standoff.
+    # The farfield placement is a modelling choice and the thing it has to stay
+    # clear of -- the separation shock, the bubble, the corner shock -- all
+    # scale with delta, so this is one of the lengths that must scale.
+    #
+    # It also still lets the leading-edge junction wave leave the domain well
+    # upstream of the interaction: at M = 2.88 the Mach angle is
+    # asin(1/2.88) = 20.3 deg, so a wave off the junction at x = -321 mm clears
+    # a 51.6 mm outer boundary in 51.6/tan(20.3 deg) = 140 mm of x, i.e. by
+    # x = -181 mm.  A shock of finite strength is steeper and exits sooner.
+    parser.add_argument("--marchDist", type=float, default=0.0516, help="wall-normal march distance [m]")
     parser.add_argument("--spanWidth", type=float, default=0.002, help="total span [m]")
     # Streamwise refinement at the two slip/no-slip junctions.  --leRefine is
     # how much finer the cell at the junction is than the segment's uniform
     # spacing, --leRatio how fast it grows back up; 4x at 1.05 per cell takes
-    # ~28 cells to relax, i.e. ~6 mm of the 175 mm plate.
+    # ~28 cells to relax, i.e. ~10 mm of the 321 mm plate.
     #
     # Off (1.0), i.e. the junction cell is the plate's own 218 um.  What the
     # refinement was buying was a first cell that resolved the shear rise
@@ -772,9 +956,9 @@ def main():
     # captured sharply -- which is not a shock this case wants sharp.  It is an
     # artefact of switching the wall BC from slip to no-slip at a point, not
     # the experiment's leading edge; it leaves the domain through the farfield
-    # at least ~96 mm upstream of the corner (a wave off the junction at the
-    # Mach angle, asin(1/2.95) = 19.8 deg, clears the 28.6 mm outer boundary in
-    # 79 mm of x, and a shock of finite strength is steeper and so exits
+    # at least ~181 mm upstream of the corner (a wave off the junction at the
+    # Mach angle, asin(1/2.88) = 20.3 deg, clears the 51.6 mm outer boundary in
+    # 140 mm of x, and a shock of finite strength is steeper and so exits
     # sooner); and a conservative scheme gets the jump across it right however
     # many cells it is smeared over.
     #
@@ -794,11 +978,13 @@ def main():
     # held from the wall out to --wnFineHeight, --wnBlend the number of layers
     # over which it ramps to whatever the outer ratio has to be to still reach
     # the outer boundary.  --wnFineHeight 0 collapses this to a single ratio
-    # and reproduces pyHyp's own distribution, which is what the 161-point mesh
-    # had.  3.5 mm is ~1.5x delta at the reference station.
+    # and reproduces pyHyp's own distribution.  6.3 mm is 1.54x delta at the
+    # reference station, the same multiple the lowRe grid's 3.5 mm was of its
+    # 2.27 mm -- so the fine region still covers the layer, the separation
+    # bubble and the near-wall half of the interaction, and nothing more.
     parser.add_argument("--wnRatio", type=float, default=1.048,
                         help="wall-normal growth ratio held below --wnFineHeight")
-    parser.add_argument("--wnFineHeight", type=float, default=0.0035,
+    parser.add_argument("--wnFineHeight", type=float, default=0.0063,
                         help="height [m] out to which --wnRatio is held")
     parser.add_argument("--wnBlend", type=int, default=10,
                         help="layers over which the growth ratio ramps to its outer value")
@@ -822,7 +1008,10 @@ def main():
     parser.add_argument("--volBlend", type=float, default=0.0,
                         help="pyHyp cell-volume blending; see the note in runPyHyp")
     parser.add_argument("--Twall", type=float, default=275.4)
-    parser.add_argument("--output", type=str, default="meshes/comp_corner_20.cgns")
+    # comp_corner_21, not _20: meshes/comp_corner_20*.cgns here are stale copies
+    # of the lowRe grid and writing over them would destroy the only record of
+    # which is which.  See the header.
+    parser.add_argument("--output", type=str, default="meshes/comp_corner_21.cgns")
     args = parser.parse_args()
 
     volumeFile = os.path.join(BASE_DIR, args.output)

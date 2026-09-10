@@ -84,6 +84,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 MARKERS = ['o', 'D', 's', '^', 'v', 'P']
 MAGENTA = '#e6007e'
@@ -175,6 +176,13 @@ def figure_eigenvalue_spectra(panels, xlim=None, ylim=None, panel_title_fmt='βL
                 fontsize=11, va='top',
                 bbox=dict(facecolor='white', edgecolor='none', pad=1.5))
 
+        # Cap the tick count.  Autoscaled spectra land on ranges like
+        # +-0.0018, where matplotlib's default locator emits ~9 ticks labelled
+        # '-0.00150' etc. and neighbouring labels run into each other.  Hao's
+        # figure 5 uses 5 x-ticks and 6 y-ticks; match that and the labels have
+        # room whatever the range turns out to be.
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
         ax.set_xlabel(r'$\omega_r L/u_\infty$')
         ax.set_ylabel(r'$\omega_i L/u_\infty$')
         if xlim is not None:

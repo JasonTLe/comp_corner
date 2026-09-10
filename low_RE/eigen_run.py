@@ -183,9 +183,23 @@ def main():
     #
     #     omega * L/u_inf = lambda_ADflow * uRef * L / u_inf
     #
-    # Read uRef off the solver rather than recomputing it, so this cannot drift
-    # from whatever reference state ADflow actually built.
-    uRef = float(solver.adflow.flowvarrefstate.uref)
+    # Read the reference state off the solver rather than recomputing it, so
+    # this cannot drift from whatever reference state ADflow actually built.
+    # NOTE: flowVarRefState.F90 declares uRef, but the f2py layer does not
+    # export it (dir(flowvarrefstate) has pref/rhoref/timeref/tref/muref/lref
+    # and no uref) -- so build it from the members that ARE exported.  Both
+    # routes below are exact identities in initializeFlow.F90, not fits:
+    #     uRef = sqrt(pRef/rhoRef)   and   timeRef = sqrt(rhoRef/pRef) = 1/uRef
+    # so they are cross-checked against each other, and a mismatch means the
+    # reference state is not what this comment assumes.
+    fvrs = solver.adflow.flowvarrefstate
+    uRef = math.sqrt(float(fvrs.pref)/float(fvrs.rhoref))
+    uRef_from_time = 1.0/float(fvrs.timeref)
+    if abs(uRef - uRef_from_time) > 1e-8*max(uRef, 1.0):
+        raise RuntimeError(
+            f"uRef is ambiguous: sqrt(pRef/rhoRef) = {uRef!r} but "
+            f"1/timeRef = {uRef_from_time!r}; the nondimensionalization is not "
+            "the one this script's scaling assumes.")
     a_inf = math.sqrt(1.4*287.085*ap.T)
     u_inf = ap.mach*a_inf
     scale = uRef*L_REF/u_inf

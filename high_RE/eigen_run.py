@@ -30,7 +30,7 @@ The fork's LST module assembles dR/dw on the mesh it is given and solves
     (-dR/dw) x = lambda (dU/dw) x
 
 There is no spanwise wavenumber anywhere in src/lst/ -- grep it -- so beta is
-set entirely by the spanwise discretization of the grid.  comp_corner_20 is two
+set entirely by the spanwise discretization of the grid.  comp_corner_21 is two
 cells across a 2 mm span between symmetry planes, i.e. this script computes the
 beta = 0 spectrum, which is Hao's figure 5(b).
 
@@ -59,29 +59,27 @@ import csv
 import math
 
 from mpi4py import MPI
-from baseclasses import AeroProblem
 from adflow import ADFLOW
+
+# Same free stream as adflow_run1/2.py -- the base flow this script linearises
+# about was converged with it, so it cannot be restated here.
+import flow_conditions
 
 ET_ROOT = "/home/jason/packages/ADflowContribute/eigen_tests"
 if ET_ROOT not in sys.path:
     sys.path.insert(0, ET_ROOT)
 from common import mumps_safe_tokens, set_petsc_options_env  # noqa: E402
 
-L_REF = 1.0e-3      # Hao's characteristic length, metres
+L_REF = flow_conditions.L_REF   # Hao's characteristic length, 1 mm
 
 
 def make_ap():
-    """Must match adflow_run2.py exactly -- the base flow was converged with it."""
-    return AeroProblem(
-        name="comp_corner_sa_edwards",
-        mach=2.95,
-        reynolds=63560,
-        T=108.0,
-        reynoldsLength=2.27e-3,
-        areaRef=1.0,
-        chordRef=1.0,
-        evalFuncs=[],
-    )
+    """Must match adflow_run2.py exactly -- the base flow was converged with it.
+
+    Which is now guaranteed rather than asserted: both go through
+    flow_conditions.make_ap(), so the free stream cannot drift between the
+    solve and the linearisation about it."""
+    return flow_conditions.make_ap("comp_corner_sa_edwards")
 
 
 def build_options(args):
@@ -115,7 +113,7 @@ def build_options(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--grid-file", default="./meshes/comp_corner_20_fixed.cgns")
+    p.add_argument("--grid-file", default="./meshes/comp_corner_21_fixed.cgns")
     p.add_argument("--restart-file",
                    default="./output_SAE/comp_corner_sa_edwards_000_vol.cgns")
     p.add_argument("--output-dir", default="./output_LST")
@@ -140,6 +138,33 @@ def main():
                         "estimate. Default 20 is not enough here (INFOG(1)=-9).")
     p.add_argument("--frozen-turbulence", action="store_true", default=False,
                    help="Hao linearizes the SA equation too; leave this OFF to match.")
+    p.add_argument("--use-ad", action="store_true", default=False,
+                   help="Build dR/dw by AUTOMATIC DIFFERENTIATION.  Leave this "
+                        "OFF and pyADflow's default useAD=False applies, which "
+                        "adjointUtils.F90:13-14 documents as 'if False, FD is "
+                        "used' -- i.e. the operator being linearised is a "
+                        "finite-difference Jacobian, and this script inherited "
+                        "that silently.  Measured on grid 21 at target 6.8: FD "
+                        "gives lambda 7.157 (omega_i L/u = 0.002100) with a "
+                        "mode peaking on the ramp shoulder at x/L = +38.5; AD "
+                        "gives 6.799 (0.001995, against Hao's 0.002) with the "
+                        "peak moved into the interaction at x/L = +8.4.  AD is "
+                        "the correct operator; turn it on.  NOTE it is not "
+                        "sufficient -- both modes stay pinned within a few "
+                        "cells of the wall (50%% of |v|^2 in 70 of 179712 "
+                        "cells) rather than filling the bubble the way Hao's "
+                        "figure 5(c-e) does, so the spectrum is still not his.")
+    p.add_argument("--standard-evp", action="store_true", default=False,
+                   help="solve the STANDARD EVP J_mod = inv(dU/dw)*(dR/dw) "
+                        "instead of the generalized pencil.  This is the only "
+                        "way to get shift != 0 without patching the fork: with "
+                        "a B matrix, SLEPc's shift-invert forms J - shift*B in "
+                        "STMatMAXPY_Private, and B carries nonzeros outside "
+                        "J's preallocated pattern, so MatAXPY dies with "
+                        "'New nonzero caused a malloc'.  With no B, the same "
+                        "step is J_mod - shift*I, which only touches the "
+                        "diagonal -- always allocated in a finite-volume "
+                        "Jacobian -- so it goes through.")
     args = p.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -183,9 +208,23 @@ def main():
     #
     #     omega * L/u_inf = lambda_ADflow * uRef * L / u_inf
     #
-    # Read uRef off the solver rather than recomputing it, so this cannot drift
-    # from whatever reference state ADflow actually built.
-    uRef = float(solver.adflow.flowvarrefstate.uref)
+    # Read the reference state off the solver rather than recomputing it, so
+    # this cannot drift from whatever reference state ADflow actually built.
+    # NOTE: flowVarRefState.F90 declares uRef, but the f2py layer does not
+    # export it (dir(flowvarrefstate) has pref/rhoref/timeref/tref/muref/lref
+    # and no uref) -- so build it from the members that ARE exported.  Both
+    # routes below are exact identities in initializeFlow.F90, not fits:
+    #     uRef = sqrt(pRef/rhoRef)   and   timeRef = sqrt(rhoRef/pRef) = 1/uRef
+    # so they are cross-checked against each other, and a mismatch means the
+    # reference state is not what this comment assumes.
+    fvrs = solver.adflow.flowvarrefstate
+    uRef = math.sqrt(float(fvrs.pref)/float(fvrs.rhoref))
+    uRef_from_time = 1.0/float(fvrs.timeref)
+    if abs(uRef - uRef_from_time) > 1e-8*max(uRef, 1.0):
+        raise RuntimeError(
+            f"uRef is ambiguous: sqrt(pRef/rhoRef) = {uRef!r} but "
+            f"1/timeRef = {uRef_from_time!r}; the nondimensionalization is not "
+            "the one this script's scaling assumes.")
     a_inf = math.sqrt(1.4*287.085*ap.T)
     u_inf = ap.mach*a_inf
     scale = uRef*L_REF/u_inf
@@ -203,6 +242,8 @@ def main():
         frozenTurbulence=args.frozen_turbulence,
         negateJacobian=True,
         linearSolver=args.linear_solver,
+        useAD=args.use_ad,
+        useInvMassJacobianStandardEVP=args.standard_evp,
         shift=args.shift, target=args.target,
         nev=args.nev, ncv=args.ncv, maxIts=args.max_its, tol=args.tol,
     )
@@ -250,7 +291,7 @@ if __name__ == "__main__":
 # plane admits).  mesh.py's --spanWidth would become 0.008727 and the span
 # would need ~16-24 cells instead of 2 to resolve sin(beta*z).
 #
-# Cost, at comp_corner_20's 1184 x 144 in (x, y): 20 spanwise cells is
+# Cost, at comp_corner_21's 1152 x 156 in (x, y): 20 spanwise cells is
 # 3.41M cells = 20.5M dofs.  eigen_tests/README.md puts the global complex LU
 # (path 2, mumps) at a ~5M-dof memory wall, so that needs path 3 (asm_lu) or
 # the real-mode time-stepper (tsa_cyl.py --pc-mode asm_ilu), and the base flow
@@ -258,7 +299,9 @@ if __name__ == "__main__":
 #
 # NOTE ALSO that figure 5 is the paper's highRe case -- Re_delta = 132 840,
 # M = 2.88, delta = 4.1 mm measured 8.04*delta upstream (p.3) -- and beta*L =
-# 0.36 is where the highRe growth rate peaks.  comp_corner_20 is calibrated to
-# the lowRe case (M = 2.95, Re_delta = 63 560, delta = 2.27 mm at 15.4*delta).
+# 0.36 is where the highRe growth rate peaks (Hao, figure 4), and comp_corner_21
+# IS the highRe case (M = 2.88, Re_delta = 132 840, delta = 4.1 mm at
+# 8.04*delta), so beta*L = 0.36 is directly the right number here -- unlike on
+# the lowRe grid, where it was borrowed from the wrong case.
 # Running THIS base flow at beta*L = 0.36 is perfectly well posed, but it is a
 # point on figure 4's lowRe curve, not a reproduction of figure 5(a).

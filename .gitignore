@@ -1,12 +1,47 @@
-# CFD solver output — 1.4 GB, regenerable, too large for GitHub.
-# Meshes and results live on disk / shared storage, not in git.
-meshes/*
-output_SA/*
-!meshes/comp_corner_14.cgns
-!meshes/comp_corner_14_fixed.cgns
-!meshes/comp_corner_20.cgns
-!meshes/comp_corner_20_fixed.cgns
-!meshes/comp_corner_20_surf.fmt
+# CFD solver output: regenerable, and big.  Ignored BY DEFAULT, not banned --
+# see "curated results" below.
+#
+# This repo stores *.cgns and *.log through Git LFS (.gitattributes), and that
+# is working: all 53 tracked CGNS are 133-byte pointers in the object store,
+# 7 KB in total for 1.385 GB of content.  So tracking a result costs the git
+# history nothing; it costs LFS storage and bandwidth quota instead.
+#
+# CURATED RESULTS ARE TRACKED ON PURPOSE.  low_RE/'s outputs are in git because
+# commit fca4212 ("Track curated results: DOCUMENTATION WORTHY, _14 meshes,
+# drop .pw") deliberately put them there, and the ! lines below are how that was
+# expressed.  These patterns are the default-off switch for the routine churn of
+# a calibration sweep; when a result is worth keeping, add it explicitly:
+#
+#     git add -f high_RE/output_SAE/comp_corner_sa_edwards_000_surf.cgns
+#
+# NOTE the leading **/.  A gitignore pattern containing a slash anywhere but at
+# the end is anchored to the directory holding the .gitignore, so the old
+# "meshes/*" / "output_SA/*" matched nothing once the cases moved into low_RE/
+# and high_RE/.  The **/ prefix makes them match at any depth.  (This anchoring
+# was NOT the reason low_RE's results are tracked -- that was deliberate, and
+# predates the reorganisation.  Ignoring a path never untracks what is already
+# committed.)
+**/meshes/*
+**/output_SA/*
+**/output_SAE/*
+**/output_LST/*
+**/doc_study/**/*.cgns
+**/calibration/
+!**/meshes/comp_corner_14.cgns
+!**/meshes/comp_corner_14_fixed.cgns
+!**/meshes/comp_corner_20.cgns
+!**/meshes/comp_corner_20_fixed.cgns
+!**/meshes/comp_corner_20_surf.fmt
+!**/meshes/comp_corner_21.cgns
+!**/meshes/comp_corner_21_fixed.cgns
+!**/meshes/comp_corner_21_surf.fmt
+!**/calibration/README.txt
+
+# Figures and solver logs are small and are the record of what each grid did.
+!**/output_SA/*.png
+!**/output_SAE/*.png
+!**/output_LST/*.png
+!**/output_LST/*.csv
 
 # WSL alternate-data-stream junk
 *:Zone.Identifier

@@ -19,25 +19,37 @@ adflow_run2.py then reloads as its restartFile.
 
 USAGE: mpiexec -n 16 python3 adflow_run1.py
 
-    nProc MATTERS. comp_corner_20_fixed.cgns is one 1185x145x3 node block, i.e.
-    1184x144x2 cells; ADflow cuts it into nProc pieces and every cut plane must
-    still land on a cell boundary after multigrid coarsening, i.e. at an even
-    cell index. Probed on this grid with MGCycle "2w": nProc = 8 and 16 work,
-    14 aborts in checkCoarse1to1 with "Non-matching block-to-block face".
-    Use 16.
+    This is the highRe case: M = 2.88, Re_delta = 132 840, delta = 4.1 mm at
+    8.04 delta upstream of the corner (Hao, JFM 2023, 971 A28, section 2,
+    after Zheltovodov et al. 1990).  The free stream is built by
+    flow_conditions.make_ap(), which is also what adflow_run2.py and
+    eigen_run.py call -- read the long note in that file before changing any
+    of it, in particular before "just" switching to the quoted density.
 
-    16 is also the right number for the machine, and not because nproc says 32.
+    nProc MATTERS. comp_corner_21_fixed.cgns is one 1153x157x3 node block, i.e.
+    1152x156x2 cells; ADflow cuts it into nProc pieces and every cut plane must
+    still land on a cell boundary after multigrid coarsening, i.e. at an even
+    cell index. 1152 = 2^7 x 3^2, so it is friendlier than the lowRe grid's
+    1184 = 2^5 x 37: mesh.py's checkMultigrid reports even splits at nProc =
+    2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 32, 36. Use 16 (1152/16 = 72).
+
+    16 is still the right number for the machine, and not because nproc says 32.
     This host is an AMD Ryzen 9 7950X: 16 PHYSICAL cores, 32 threads. nproc
     counts SMT siblings, which are not extra compute -- 16 ranks is one per
     physical core, i.e. saturation, not headroom. Running 32 would put two
     ranks on each core sharing one FP unit and one L2, which for a
-    bandwidth-bound solve is neutral at best; it is moot anyway, since
-    1184/32 = 37 is odd and would abort.
+    bandwidth-bound solve is neutral at best. (On the lowRe grid it was moot
+    as well, since 1184/32 = 37 is odd and aborted; here 1152/32 = 36 is even
+    and 32 would actually run. It is still not worth it.)
 
     The counts are not an accident -- mesh.py picks its default point counts so
     ni-1 factorises well, and prints the workable nProc list when it runs. The
     earlier 550/220 defaults gave ni-1 = 926 = 2 x 463 with 463 prime, and
     *every* nProc from 2 to 32 aborted, nProc = 2 included.
+
+    The grid is bigger than the lowRe one -- 359 424 cells against 340 992 --
+    because it holds the same cells-per-delta over a 1.9x longer plate. Expect
+    stage 1 to cost ~5% more per iteration, not more than that.
 
 """
 
@@ -45,11 +57,15 @@ import numpy as np
 import argparse
 import os
 from adflow import ADFLOW
-from baseclasses import AeroProblem
 from mpi4py import MPI
 
+# The free stream lives in one place for all three scripts -- see the note at
+# the top of flow_conditions.py on why Re_delta and the quoted density cannot
+# both be honoured, and which one this case matches.
+import flow_conditions
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_20_fixed.cgns")
+parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_21_fixed.cgns")
 parser.add_argument("--task", choices=["analysis", "polar"], default="analysis")
 args = parser.parse_args()
 outputDirectory = "./output_SA"
@@ -105,16 +121,19 @@ aeroOptions = {
     "useft2SA": False,
     "turbResScale": 1e5, # default
     # Solver Parameters
-    # 2w needs one coarsening. The grid is a single 700x200x2 block that ADflow
-    # cuts into nProc sub-blocks, and every cut has to stay 1-to-1 matching after
-    # coarsening or coarseUtils.F90:1528 aborts with "Non-matching block-to-block
-    # face". On this grid that only holds for nProc = 10 or 14 -- 4, 8 and 12 all
-    # abort. Use 14 (see the usage line above); it is also the physical core count.
+    # 2w needs one coarsening. The grid is a single 1152x156x2-cell block that
+    # ADflow cuts into nProc sub-blocks, and every cut has to stay 1-to-1
+    # matching after coarsening or coarseUtils.F90:1528 aborts with
+    # "Non-matching block-to-block face". See the usage line above for the
+    # workable nProc list on this grid; use 16, which is also the physical core
+    # count.
     "MGCycle": "2w",
-    # Start on the COARSE grid (level 2 = 350x100x1) and prolong to the fine grid.
+    # Start on the COARSE grid (level 2 = 576x78x1) and prolong to the fine grid.
     # This is the single most important change for grid 15. Starting ANK on the
     # fine grid straight from uniform freestream drives a near-wall cell
-    # unphysical on iteration 8 -- Y+_max jumps 9 -> 5297 -- and the line search
+    # unphysical on iteration 8 -- Y+_max jumps 9 -> 5297 (measured on the lowRe
+    # grid; this one has the same s0 and a 16% stiffer free stream, so if
+    # anything it is worse) -- and the line search
     # then rejects every step forever (totalRes frozen at 6.03e8, above the 3.74e8
     # it started from). The coarse grid has 4x fewer cells and a 2x larger first
     # off-wall cell, so the startup transient is survivable there; the prolonged
@@ -144,7 +163,10 @@ aeroOptions = {
     # the Newton step. ANKCFL0=5 (the default, and what grid 14 used) is too
     # aggressive here: grid 15's first off-wall cell is 9.56e-7 m against grid
     # 14's 1.60e-6 m, so the wall-normal Jacobian entries are stiffer and a
-    # near-Newton first step overshoots into unphysical territory. 1.0 gives
+    # near-Newton first step overshoots into unphysical territory. comp_corner_21
+    # keeps s0 = 8.0e-7 m (mesh.py deliberately does NOT scale it with delta --
+    # see the note there), so that argument carries over unchanged; measured
+    # y+ on the calibrated grid is 0.106 mean / 0.479 max. 1.0 gives
     # enough regularisation to get started, and the ramp takes it back over 200
     # within ~35 iterations anyway.
     "ANKCFL0": 1.0,
@@ -182,30 +204,12 @@ aeroOptions = {
     "nCycles": 20000,
 }
 
-ap = AeroProblem(
-        name = "comp_corner_sa",
-        mach = 2.95,
-        reynolds = 63560,
-        T = 108.0,
-        # rho = 0.314,
-        reynoldsLength = 2.27e-3, # change this so that density matches up
-        areaRef = 1.0,
-        chordRef = 1.0,
-        evalFuncs = []
-)
-
-# echo the derived free-stream state ADflow will use 
-print("=" * 50)
-print(f"Mach              : {ap.mach:.4f}")
-print(f"Velocity V        : {ap.V:.3f} m/s")
-print(f"Speed of sound a  : {ap.a:.3f} m/s")
-print(f"Density rho       : {ap.rho:.5f} kg/m^3")
-print(f"Temperature T     : {ap.T:.3f} K")
-print(f"Pressure P        : {ap.P:.3f} Pa")
-print(f"Viscosity mu      : {ap.mu:.4e} Pa.s")
-print(f"reynoldsLength L  : {ap.reynoldsLength:.4e} m")
-print(f"Re = rho*V*L/mu   : {ap.re:.1f}")
-print("=" * 50)
+# Stage 1 and stage 2 MUST see the same free stream -- stage 2 restarts from
+# this stage's volume file, and a free stream that moved between them would
+# rescale the field the restart is trying to continue. Hence the shared module,
+# rather than a second literal AeroProblem here that can drift out of step.
+ap = flow_conditions.make_ap("comp_corner_sa")
+flow_conditions.report(ap, comm)
 
 # Create solver
 CFDSolver = ADFLOW(options = aeroOptions)

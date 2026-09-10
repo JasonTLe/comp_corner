@@ -14,6 +14,11 @@ writes two PNGs next to wherever you run it, named after the input file:
     comp_corner_000_surf_wall.png        p/p_inf, Cf, y+ and the incoming
                                          boundary-layer profile
 
+If a context/ directory sits next to this script, the digitized paper curves
+in it (p*.csv, cf*.csv) are resampled into continuous lines and drawn over the
+p/p_inf and Cf panels.  --context DIR points somewhere else, --no-context
+turns the overlay off.
+
 and prints a table of derived quantities (separation length, shock angle,
 boundary-layer thickness, near-wall resolution, ...).
 
@@ -90,6 +95,7 @@ import sys
 import os
 import struct
 import argparse
+import glob
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')          # render to file; no display needed
@@ -102,12 +108,28 @@ KARMAN, BLOG = 0.41, 5.2       # log-law constants
 MM = 1e3                       # metres -> millimetres, used in every plot
 
 # Target incoming boundary layer, from the experiments of Zheltovodov et al.
-# (1990) as used by Hao, JFM 2023, 971 A28 (low-Re case): delta = 2.27 mm
-# measured 15.4 delta upstream of the corner, giving Re_delta = 63560.  The
-# station is therefore fixed in space, unlike Case.x_ref which follows x_sep.
-DELTA_EXP = 2.27e-3            # experimental boundary-layer thickness, metres
-X_EXP = -15.4*DELTA_EXP        # station where it was measured, metres (x=0 = corner)
-RE_DELTA_EXP = 63560           # Re based on DELTA_EXP and free-stream properties
+# (1990) as used by Hao, JFM 2023, 971 A28.  THIS COPY IS THE highRe CASE:
+# delta = 4.1 mm measured 8.04 delta upstream of the corner, giving
+# Re_delta = 132 840.  (The lowRe copy of this script uses 2.27 mm at
+# 15.4 delta / 63 560; the two stations are only 2 mm apart in x, so a table
+# produced by the wrong copy looks entirely plausible.  Check which directory
+# you are in.)  The station is fixed in space, unlike Case.x_ref which follows
+# x_sep.
+#
+# These three are what mesh.py's --plateLength is calibrated against, and they
+# are duplicated in flow_conditions.py (DELTA_EXP / X_EXP / RE_DELTA) because
+# this script is standalone and deliberately imports no ADflow stack.  If one
+# moves, move the other.
+#
+# NOTE on the Re_delta row of the table: it is Re_m * delta_measured, and Re_m
+# comes from the CGNS reference state, i.e. from whichever convention
+# flow_conditions.MATCH selected.  Under MATCH = "rho" it is pinned at
+# 117 241/4.1 mm and the "-11.7%" it will report against RE_DELTA_EXP is the
+# experiment's own inconsistency, not a calibration error -- read the delta row
+# instead, which is the one --plateLength actually controls.
+DELTA_EXP = 4.1e-3             # experimental boundary-layer thickness, metres
+X_EXP = -8.04*DELTA_EXP        # station where it was measured, metres (x=0 = corner)
+RE_DELTA_EXP = 132840          # Re based on DELTA_EXP and free-stream properties
 
 # Sutherland's law for the dynamic viscosity of air, SI units.
 mu = lambda T: 1.458e-6 * T ** 1.5 / (T + 110.4)
@@ -730,7 +752,7 @@ def oblique_shock_beta(M, theta):
 
     by scanning beta from the Mach angle upwards and taking the FIRST sign
     change.  Taking any other root silently returns the strong solution,
-    which for M = 2.95 and a 25 deg ramp is 79 deg instead of 44.6 deg.
+    which for M = 2.88 and a 25 deg ramp is 79 deg instead of 44.6 deg.
 
     Parameters
     ----------
@@ -893,8 +915,21 @@ class Case:
         negative means it is reversed.  The tangent is taken from the wall
         geometry itself, so a plate and a ramp are handled the same way.
         """
-        xs, ys, pr, cf, rw, Tw, cfm = [], [], [], [], [], [], []
+        # Which points are on a VISCOUS wall.  ADflow names the surface zones
+        # after the BC type -- EulerWallBCZone* for the two inviscid slip
+        # segments, NSWallIsothermal*/NSWallAdiabatic* for the plate and ramp --
+        # so the split is readable straight off the file.  It matters: y+ and
+        # T_w are only defined on a no-slip wall, and averaging the slip
+        # segments into them is what used to make this script report
+        # T_w/T_inf = 2.243 for a wall held at exactly 275.400 K (= 2.399) and a
+        # y+ minimum of 0.000 that was just the inviscid wall's zero shear.
+        xs, ys, pr, cf, rw, Tw, cfm, vs = [], [], [], [], [], [], [], []
+        wallBC = set()
         for z in zones:
+            viscous = 'NSWall' in z.name
+            if viscous:
+                wallBC.add('isothermal' if 'Isothermal' in z.name else
+                           'adiabatic' if 'Adiabatic' in z.name else 'viscous')
             X, Y, D = self._zone_arrays(z)
             order = np.argsort(X[0])
             xv, yv = X[0][order], Y[0][order]
@@ -912,12 +947,19 @@ class Case:
             rw.append(get('Density'))
             Tw.append(get('Temperature'))
             cfm.append(get('SkinFrictionMagnitude'))
+            vs.append(np.full(xs[-1].shape, viscous))
 
         cat = np.concatenate
         o = np.argsort(cat(xs))
         self.xw, self.yw = cat(xs)[o], cat(ys)[o]
         self.pw, self.cfw = cat(pr)[o], cat(cf)[o]
         self.rww, self.Tww, self.cfm = cat(rw)[o], cat(Tw)[o], cat(cfm)[o]
+        self.viscw = cat(vs)[o]
+        self.wallBC = '/'.join(sorted(wallBC)) if wallBC else 'viscous'
+        # Same mask on the field-cell abscissa self.xs, for y+ (set in
+        # _derive_quantities, which runs after this).
+        self._visc_x = (self.xw[self.viscw].min(), self.xw[self.viscw].max()) \
+                       if self.viscw.any() else (-np.inf, np.inf)
 
     # --- derived quantities -------------------------------------------------
 
@@ -949,6 +991,11 @@ class Case:
         T_w = np.interp(self.xs, x, self.Tww)*self.Tref
         self.utau = np.sqrt(np.abs(tau)/rho_w)
         self.yplus = rho_w*self.utau*self.dw/mu(T_w)
+        # y+ is a no-slip quantity.  Keep the full array for plotting (the
+        # inviscid stretches read ~0 and that is honest on a graph), but expose
+        # a viscous-only view for the min/mean/max the table reports.
+        lo, hi = self._visc_x
+        self.yplusv = self.yplus[(self.xs >= lo) & (self.xs <= hi)]
 
         # Incoming boundary layer, sampled 15 mm upstream of separation.
         self.x_ref = self.x_sep - 0.015
@@ -1128,6 +1175,172 @@ class Case:
 
 
 # =============================================================================
+#  Part 3b   Reference data digitized from the paper
+# =============================================================================
+#
+# The comparison curves in context/ come out of a plot digitizer, so they are
+# not quite a function of x.  On the steep parts -- the pressure jump, the Cf
+# plunge into the bubble, the spike at the corner -- the operator's x scatters
+# by a few tenths of a mm while y marches on, and in two places the trace
+# doubles back over itself.  x therefore decreases 31 times in cf_xl.csv.
+# Joined with a line those show up as zig-zags; drawn as markers the file
+# reads as scattered data, which it is not -- the paper draws one curve.
+#
+# Turning it back into that curve takes three steps:
+#
+#   1. sort by x and average y over the samples that share one x.  The jitter
+#      is small compared with the spacing of genuinely distinct stations, so
+#      sorting reorders only within the doubled-back runs, and averaging puts
+#      the curve through the middle of them.  What survives is the height of
+#      those near-vertical runs (~4e-4 in Cf at x = -9.7 and x = -0.3), which
+#      no single-valued y(x) can reproduce and which is invisible at the
+#      scale these panels are drawn at.
+#   2. interpolate with a monotone cubic (Fritsch-Carlson / PCHIP).  A natural
+#      cubic spline would ring at the pressure jump and dip Cf below its own
+#      data inside the bubble; the monotone form cannot overshoot, so the
+#      plateau stays flat and the jump stays a jump.
+#   3. evaluate on a dense uniform grid, so the drawn line is smooth at any
+#      figure size.
+#
+# Implemented here rather than pulled from scipy so that the script keeps its
+# numpy + matplotlib only requirement.
+
+REF_LABEL = 'Hao'
+# Electric violet, chosen by maximizing the smallest CIELAB distance to every
+# other colour on panels (a) and (b): ADflow's dark green, the crimson of the
+# inviscid line and the S/R markers, the pale orange band, and the black/grey
+# of the axes.  Its nearest neighbour is crimson at dE 125 -- and crimson,
+# marking separation and reattachment, is the one it must not be confused
+# with.  Magenta, the obvious alternative, manages only dE 55 there.  The
+# dashes keep the curve separable in greyscale as well; short ones (3 on,
+# 1.4 off) so the Cf spike at the corner still resolves as a spike.
+REF_COLOR = '#8b00ff'
+REF_DASH = (0, (3, 1.4))
+
+# Both wall panels draw ADflow in one colour, so the eye carries "this is the
+# computation" from the pressure panel down to the skin-friction panel.
+ADFLOW_COLOR = '#0b6b3a'
+N_REF = 1200                   # samples in the resampled reference curve
+
+
+def _pchip_slopes(x, y):
+    """Fritsch-Carlson tangents: the derivative estimate that cannot overshoot.
+
+    At an interior node the harmonic mean of the two neighbouring secants is
+    used, which vanishes whenever they disagree in sign.  That is what pins
+    the interpolant to the data at a local extremum (the bottom of the Cf
+    bubble, the top of the pressure plateau) instead of letting it swing past.
+    """
+    h = np.diff(x)
+    d = np.diff(y)/h                                  # secant slopes
+    m = np.zeros_like(y)
+
+    # Interior nodes: harmonic mean, weighted by the interval lengths.
+    same = np.sign(d[:-1])*np.sign(d[1:]) > 0
+    w1, w2 = 2*h[1:] + h[:-1], h[1:] + 2*h[:-1]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        m[1:-1] = np.where(same, (w1 + w2)/(w1/d[:-1] + w2/d[1:]), 0.0)
+
+    # Ends: one-sided three-point formula, clipped so it stays monotone.
+    def end(d0, d1, h0, h1):
+        s = ((2*h0 + h1)*d0 - h0*d1)/(h0 + h1)
+        if np.sign(s) != np.sign(d0):
+            return 0.0
+        if np.sign(d0) != np.sign(d1) and abs(s) > abs(3*d0):
+            return 3*d0
+        return s
+
+    m[0] = end(d[0], d[1], h[0], h[1]) if len(d) > 1 else d[0]
+    m[-1] = end(d[-1], d[-2], h[-1], h[-2]) if len(d) > 1 else d[-1]
+    return m
+
+
+def _pchip(x, y, xq):
+    """Evaluate the monotone cubic through (x, y) at xq, on the cubic Hermite
+    basis of each interval."""
+    m = _pchip_slopes(x, y)
+    k = np.clip(np.searchsorted(x, xq) - 1, 0, len(x) - 2)
+    h = x[k+1] - x[k]
+    t = (xq - x[k])/h
+    t2, t3 = t*t, t*t*t
+    return ((2*t3 - 3*t2 + 1)*y[k] + (t3 - 2*t2 + t)*h*m[k]
+            + (-2*t3 + 3*t2)*y[k+1] + (t3 - t2)*h*m[k+1])
+
+
+def load_reference(path, n=N_REF):
+    """One digitized curve as a continuous line.
+
+    Returns (x, y) sampled on a uniform grid across the file's x range, or
+    None if the file is missing or too short to interpolate.  The CSV is a
+    two-column "x, y" export with a header line; x is in mm, y in whatever
+    the panel plots.
+    """
+    if not os.path.isfile(path):
+        return None
+    d = np.atleast_2d(np.loadtxt(path, delimiter=',', skiprows=1))
+    if d.shape[0] < 2:
+        return None
+    x, y = d[:, 0], d[:, 1]
+
+    # Sort, then average the ties.  np.unique gives, for every sample, the
+    # index of the station it belongs to, so bincount sums and counts the
+    # duplicates in one pass.
+    xu, inv = np.unique(x, return_inverse=True)
+    yu = np.bincount(inv, weights=y)/np.bincount(inv)
+    if len(xu) < 2:
+        return None
+
+    xq = np.linspace(xu[0], xu[-1], n)
+    return xq, _pchip(xu, yu, xq)
+
+
+def zero_crossings(x, y):
+    """(x_sep, x_rea) of a Cf curve: where it falls through zero and where it
+    rises back.
+
+    Same convention as Case._derive_quantities -- the FIRST falling crossing
+    and the LAST rising one -- so that the small positive spike the corner
+    puts in the middle of the bubble is stepped over rather than mistaken for
+    reattachment followed by a second separation.  Kept here as a free
+    function because it has to run on the digitized curve too, which is not a
+    Case and has none of a Case's geometry.
+    """
+    def crossings(rising):
+        out = []
+        for i in range(len(y) - 1):
+            if y[i] != 0 and (y[i] > 0) != (y[i+1] > 0) \
+                    and (y[i+1] > y[i]) == rising:
+                out.append(x[i] + (x[i+1] - x[i])*(-y[i])/(y[i+1] - y[i]))
+        return out
+    sep, rea = crossings(False), crossings(True)
+    return (min(sep) if sep else np.nan,
+            max(rea) if rea else np.nan)
+
+
+def load_context(dirname):
+    """The paper's wall curves, keyed by the panel they belong to.
+
+    p*.csv    wall pressure ratio p/p_inf   -> panel (a)
+    cf*.csv   skin friction Cf              -> panel (b)
+
+    Matched by prefix rather than by exact name: the lowRe and highRe
+    directories hold the same two curves under different names (cf_xl.csv vs
+    cf_xl_high.csv), and a file that has been renamed should still be found.
+    The cf glob is tried first so that "cf*" never loses its files to "p*".
+    """
+    if not dirname or not os.path.isdir(dirname):
+        return {}
+    out = {}
+    for key, pattern in (('cf', 'cf*.csv'), ('p', 'p*.csv')):
+        for path in sorted(glob.glob(os.path.join(dirname, pattern))):
+            curve = load_reference(path)
+            if curve is not None:
+                out[key] = curve
+                break
+    return out
+
+
+# =============================================================================
 #  Part 4   Streamline tracing
 # =============================================================================
 #
@@ -1238,9 +1451,25 @@ def figure_flowfield(case, fname, exag=3.5):
     ax.set_xlim(x0d, x1d); ax.set_ylim(-1.2, y1d*1.02); ax.set_aspect('equal')
     ax.set_ylabel('y [mm]')
     fig.colorbar(pc, ax=ax, pad=.01, fraction=.022).set_label('M')
+    # The wall label used to be the hard-coded string 'adiabatic wall', which was
+    # simply false: both Zheltovodov cases are run ISOTHERMAL at 275.4 K (see
+    # mesh.py --Twall, applied to the CGNS by fix_bc.py).
+    #
+    # Take the label from the BOUNDARY CONDITION, not from comparing T_w against
+    # the recovery temperature.  A temperature test looks reasonable and is a
+    # trap: in the highRe case T_w/T_inf = 2.399 against the
+    # adiabatic 2.493, but in the lowRe case the two are 0.6% apart,
+    # so a "within 1% of adiabatic" rule would label an isothermal wall adiabatic
+    # on a numerical coincidence.  ADflow names the surface zone after the BC it
+    # applied -- NSWallIsothermalBCZone* here -- so the file already says it.
+    Tw_ratio = float(np.nanmean(case.Tww[case.viscw]))
+    wall = ('adiabatic wall' if case.wallBC == 'adiabatic' else
+            'isothermal wall T$_w$=%.1f K (T$_w$/T$_\\infty$=%.2f)'
+            % (Tw_ratio*case.Tref, Tw_ratio) if case.wallBC == 'isothermal' else
+            'viscous wall T$_w$/T$_\\infty$=%.2f' % Tw_ratio)
     ax.set_title('(a)  Mach number  —  %s  |  M$_\\infty$=%.2f, %.1f° corner, '
-                 'adiabatic wall, Re=%.2f×10$^7$ m$^{-1}$'
-                 % (case.label, case.Minf, case.ramp, case.Re_m/1e7),
+                 '%s, Re=%.2f×10$^7$ m$^{-1}$'
+                 % (case.label, case.Minf, case.ramp, wall, case.Re_m/1e7),
                  loc='left', fontsize=10.5, pad=5)
     ax.text(x0d + 0.02*(x1d - x0d), 0.83*y1d, 'white: sonic line M = 1',
             color='w', fontsize=8.5)
@@ -1270,6 +1499,11 @@ def figure_flowfield(case, fname, exag=3.5):
     d0 = case.delta0*MM
     x0 = case.x_sep*MM - 9*d0
     x1 = case.x_rea*MM + 9*d0
+    # Always keep the experiment's measuring station in frame -- it is what
+    # --plateLength is calibrated against, and it is annotated below.  It lands
+    # inside the 9*delta0 run-in for the highRe case but ~2 mm outside it for
+    # the lowRe one, so widen rather than let the marker fall off the axes.
+    x0 = min(x0, X_EXP*MM - 2.2*d0)
     y_reatt = np.interp(case.x_rea, case.xw, case.yw)*MM
     y0, y1 = -0.95*d0, y_reatt + 3.0*d0
 
@@ -1338,6 +1572,37 @@ def figure_flowfield(case, fname, exag=3.5):
             r'$L_{sep}$ = %.2f mm' % (case.Lsep*MM), color='0.1', fontsize=9,
             weight='bold', ha='center', va='bottom', zorder=11,
             path_effects=halo)
+    # --- the experiment's measuring station ---------------------------------
+    # delta at this fixed station, and the Re_delta built on it, are the two
+    # numbers the whole case is calibrated to (mesh.py --plateLength), so draw
+    # them rather than leaving them in the table.  The bar is the boundary-layer
+    # thickness TO SCALE, i.e. it carries the panel's vertical exaggeration like
+    # everything else here.
+    xe = X_EXP*MM
+    ye = np.interp(X_EXP, case.xw, case.yw)*MM
+    de = case.delta_exp*MM
+    cap = 0.20*d0
+    ax.plot([xe, xe], [ye, ye + de], color='#ffd400', lw=2.6,
+            solid_capstyle='butt', zorder=10.6, path_effects=halo)
+    for yy in (ye, ye + de):
+        ax.plot([xe - cap, xe + cap], [yy, yy], color='#ffd400', lw=2.2,
+                zorder=10.6, path_effects=halo)
+    # Anchor the caption in AXES fraction, not data coordinates, with a leader
+    # to the bar.  Placing it beside the bar in data units overflows the left
+    # spine whenever the station sits near the edge of the window -- which is
+    # exactly the lowRe case, where -15.4*delta lands 2 mm outside the
+    # separation-centred view and the caption ran off the axes.
+    ax.annotate('$\\delta$ = %.3f mm\n$Re_\\delta$ = %s\nat x = %.2f mm = %.2f$\\delta$'
+                % (de, format(int(round(case.Re_delta)), ',').replace(',', '\u2009'),
+                   xe, X_EXP/DELTA_EXP),
+                xy=(xe, ye + de), xycoords='data',
+                xytext=(0.015, 0.72), textcoords='axes fraction',
+                color='0.1', fontsize=8.5, ha='left', va='top', zorder=11,
+                bbox=dict(boxstyle='round,pad=0.30', fc='#fff4c2',
+                          ec='#b38f00', lw=0.9),
+                arrowprops=dict(arrowstyle='-', color='#ffd400', lw=1.6,
+                                shrinkA=4, shrinkB=2, path_effects=halo))
+
     xl = np.array([0, (x1 - 0)*0.85])
     ax.plot(xl, np.tan(beta)*xl, color='w', ls=(0, (6, 4)), lw=1.3, zorder=8)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
@@ -1356,7 +1621,7 @@ def figure_flowfield(case, fname, exag=3.5):
     plt.close(fig)
 
 
-def figure_wall(case, fname):
+def figure_wall(case, fname, ref=None):
     """Four-panel view of what happens at the wall.
 
     (a) p/p_inf: the plateau marks the separated region, and the final level
@@ -1366,7 +1631,11 @@ def figure_wall(case, fname):
         the buffer layer, which is the one place you do not want to sit.
     (d) The incoming boundary layer in wall units.  If the points follow
         u+ = y+ then the log law, the layer is genuinely turbulent there.
+
+    ref, if given, is the dict from load_context(): the paper's digitized
+    wall curves, drawn over panels (a) and (b) as continuous lines.
     """
+    ref = ref or {}
     p_inv = case.p_inviscid
     beta = oblique_shock_beta(case.Minf, np.radians(case.ramp))
     xw = case.xw*MM
@@ -1383,14 +1652,18 @@ def figure_wall(case, fname):
     # p/p_inf is what ADflow stores, so it is plotted directly.  The right-hand
     # axis carries the same curve as Cp; the two are one affine map apart,
     #     p/p_inf = 1 + QD*Cp,   QD = 0.5*gamma*M_inf^2,
-    # which for M_inf = 2.95 is p/p_inf = 1 + 6.092 Cp.
+    # which for M_inf = 2.88 is p/p_inf = 1 + 5.806 Cp.  (M_inf itself is read
+    # from the file's reference state, so nothing here is hard-coded to it.)
     ax = fig.add_subplot(gs[0, :])
-    ax.plot(xw, case.pw, color='#1f4e9c', lw=2.0)
+    ax.plot(xw, case.pw, color=ADFLOW_COLOR, lw=2.0, label='ADflow (SA-Edwards)')
+    if 'p' in ref:
+        ax.plot(*ref['p'], color=REF_COLOR, lw=1.8, ls=REF_DASH,
+                zorder=3, label=REF_LABEL)
     ax.axhline(p_inv, color='crimson', ls='--', lw=1.2,
                label='inviscid oblique shock, $p/p_\\infty$ = %.3f  ($C_p$ = %.3f)'
                      % (p_inv, case.cp_inviscid))
     ax.axvspan(xs, xr, color='#ffd9a0', alpha=.6, zorder=0,
-               label='separated region (%.2f → %.2f mm)' % (xs, xr))
+               label='separated region')
     ax.axhline(1.0, color='.6', lw=.8)
     ax.set_xlim(-40, 30); ax.set_ylim(0, 5) # ax.set_xlim(-W, W); ax.set_ylim(0.85, 1 + (p_inv - 1)*1.25)
     ax.set_ylabel('$p/p_\\infty$')
@@ -1402,28 +1675,65 @@ def figure_wall(case, fname):
 
     # --- (b) skin friction --------------------------------------------------
     ax = fig.add_subplot(gs[1, :])
-    ax.plot(xw, case.cfw, color='#0b6b3a', lw=2.0)
+    ax.plot(xw, case.cfw, color=ADFLOW_COLOR, lw=2.0, label='ADflow (SA-Edwards)')
+    if 'cf' in ref:
+        ax.plot(*ref['cf'], color=REF_COLOR, lw=1.8, ls=REF_DASH,
+                zorder=3, label=REF_LABEL)
     ax.axhline(0, color='k', lw=1.0)
-    ax.axvspan(xs, xr, color='#ffd9a0', alpha=.6, zorder=0)
-    ax.set_xlim(-40, 30); ax.set_ylabel('$C_f$ (wall-tangent)'); ax.grid(alpha=.25); ax.set_ylim(-0.002, 0.004)
+    ax.axvspan(xs, xr, color='#ffd9a0', alpha=.6, zorder=0,
+               label='separated region')
+    # After the span, not before: a legend only picks up what already exists.
+    ax.legend(fontsize=9, loc='upper left')
+    ax.set_xlim(-40, 30); ax.set_ylabel('$C_f$ (wall-tangent)'); ax.grid(alpha=.25); ax.set_ylim(-0.0030, 0.004)
     # Label S and R against the Cf curve -- Cf = 0 is what *defines* them, so
-    # this is the panel where they mean something.
+    # this is the panel where they mean something, and each badge is anchored
+    # to the point (x, 0) on the curve it belongs to.
     #
-    # Place them in axis fractions, not data units.  The old code put them at
-    # 0.7*max(Cf) over a window four bubble-lengths wide, which reaches onto the
-    # ramp where Cf recovers well past this panel's 0.004 limit: on
-    # comp_corner_18 that is y = 0.0087, twice the top of the axes.  Matplotlib
-    # does not clip text by default, so the two labels were drawn outside this
-    # panel and landed on top of the wall-pressure panel above -- which is why
-    # S and R appeared to belong to p/p_inf.  get_xaxis_transform() keeps x in
-    # data coordinates and y in axis fractions, so they cannot escape again.
-    for xx, txt, dx, ha in [(xs, 'S  %.2f mm' % xs, -1.5, 'right'),
-                            (xr, 'R  %.2f mm' % xr, 1.5, 'left')]:
-        ax.axvline(xx, color='crimson', lw=1.1, ls='--')
-        ax.text(xx + dx, 0.90, txt, fontsize=9, color='crimson', ha=ha,
-                va='center', transform=ax.get_xaxis_transform())
-    ax.set_title('(b)  Skin friction  —  L$_{sep}$ = %.2f mm = %.1f δ$_0$'
-                 % (case.Lsep*MM, case.Lsep/case.delta0), loc='left', fontsize=10.5, pad=5)
+    # Hao's stations are read off the digitized curve with the same rule the
+    # solution gets, rather than taken from the paper's text: whatever bias
+    # the digitizing introduced then lands on both the curve and its markers,
+    # so the S-to-S and R-to-R gaps drawn here are a like-for-like comparison.
+    #
+    # Two rows, because the two curves separate within a millimetre of each
+    # other and badges on one row would collide.  ADflow's sit at Cf =
+    # -0.0019, Hao's below at -0.0026, which is what the extra 1e-3 of bottom
+    # margin above is for: both rows have to clear the floor of the bubble
+    # (-0.0014 here) as well as each other, since the offsets are not enough
+    # to carry them clear of it horizontally.
+    #
+    # The outer offset belongs to the UPPER row.  Give both rows the same one
+    # and the lower badge's leader, climbing inward from further down, rules a
+    # line straight through the upper badge's text -- which is what it did.
+    # Pairing outer-with-upper (8 mm) and inner-with-lower (3 mm) makes the
+    # lower leader the steeper of the two, so it starts inboard of the upper
+    # badge and never reaches it.  Each badge takes the colour of its own
+    # curve -- the crimson these used to be matched neither one.  Offsets go
+    # outward, S left and R right, so the leaders splay apart rather than
+    # lean across the bubble between them.
+    halo = [pe.withStroke(linewidth=2.6, foreground='w')]
+    rows = [(xs, xr, ADFLOW_COLOR, -0.0019, 8.0)]
+    if 'cf' in ref:
+        hs, hr = zero_crossings(*ref['cf'])
+        if np.isfinite(hs) and np.isfinite(hr):
+            rows.append((hs, hr, REF_COLOR, -0.0026, 3.0))
+    for x_s, x_r, colour, y_lab, dx in rows:
+        for tag, xx, side in [('S', x_s, -1), ('R', x_r, +1)]:
+            ax.plot([xx], [0.0], 'o', ms=6, mfc='w', mec=colour, mew=1.6,
+                    zorder=6)
+            ax.annotate('%s  %.2f mm' % (tag, xx), xy=(xx, 0.0),
+                        xytext=(xx + side*dx, y_lab),
+                        color=colour, fontsize=9, weight='bold',
+                        ha='center', va='center', zorder=7, path_effects=halo,
+                        arrowprops=dict(arrowstyle='-', color=colour, lw=1.1,
+                                        shrinkA=3, shrinkB=5,
+                                        path_effects=halo))
+    title = ('(b)  Skin friction  —  L$_{sep}$ = %.2f mm = %.1f δ$_0$'
+             % (case.Lsep*MM, case.Lsep/case.delta0))
+    if len(rows) > 1:
+        title += '   (%s: %.2f mm, %+.1f%%)' % (
+            REF_LABEL, rows[1][1] - rows[1][0],
+            100*((rows[1][1] - rows[1][0])/(case.Lsep*MM) - 1))
+    ax.set_title(title, loc='left', fontsize=10.5, pad=5)
 
     # --- (c) near-wall resolution -------------------------------------------
     ax = fig.add_subplot(gs[2, 0])
@@ -1436,8 +1746,9 @@ def figure_wall(case, fname):
     ax.set_xlim(x_left, case.xs.max()*MM); ax.set_ylim(1e-2, 60)
     ax.set_xlabel('x [mm]'); ax.set_ylabel('$y^+$ of first cell')
     ax.grid(alpha=.25, which='both')
-    ax.set_title('(c)  $y^+$ = %.2f – %.2f (mean %.2f);  first cell %.2f–%.2f µm'
-                 % (case.yplus.min(), case.yplus.max(), case.yplus.mean(),
+    ax.set_title('(c)  $y^+$ = %.2f – %.2f (mean %.2f) on the viscous wall;'
+                 '  first cell %.2f–%.2f µm'
+                 % (case.yplusv.min(), case.yplusv.max(), case.yplusv.mean(),
                     case.dw.min()*1e6, case.dw.max()*1e6),
                  loc='left', fontsize=10.5, pad=5)
 
@@ -1493,9 +1804,9 @@ REPORT = [
     ('beta theory [deg]',   lambda c: '%.2f' % np.degrees(
                                 oblique_shock_beta(c.Minf, np.radians(c.ramp)))),
     ('1st cell [um]',       lambda c: '%.2f - %.2f' % (c.dw.min()*1e6, c.dw.max()*1e6)),
-    ('y+ min/mean/max',     lambda c: '%.3f / %.3f / %.3f' % (c.yplus.min(),
-                                c.yplus.mean(), c.yplus.max())),
-    ('T_w/T_inf',           lambda c: '%.4f' % np.nanmean(c.Tww)),
+    ('y+ min/mean/max',     lambda c: '%.3f / %.3f / %.3f  (viscous wall only)'
+                                % (c.yplusv.min(), c.yplusv.mean(), c.yplusv.max())),
+    ('T_w/T_inf',           lambda c: '%.4f' % np.nanmean(c.Tww[c.viscw])),
     ('  adiabatic theory',  lambda c: '%.4f' % (1 + 0.9*(GAM-1)/2*c.Minf**2)),
     ('reverse-flow cells',  lambda c: '%d' % int((c.u < 0).sum())),
 ]
@@ -1528,19 +1839,28 @@ def main():
                     help='print the CGNS tree and exit, making no figures')
     ap.add_argument('--no-figs', action='store_true',
                     help='print the table only, make no figures')
+    ap.add_argument('--context', default=None, metavar='DIR',
+                    help='directory of digitized reference curves (p*.csv, '
+                         'cf*.csv) to overlay on the wall figure '
+                         '(default: a context/ directory next to this script)')
+    ap.add_argument('--no-context', action='store_true',
+                    help='skip the reference overlay even if context/ exists')
     ap.add_argument('--exag', type=float, default=3.5,
                     help='vertical exaggeration hint for the close-up panel')
     ap.add_argument('--delta-exp', type=float, default=DELTA_EXP*MM, metavar='MM',
                     help='experimental boundary-layer thickness in mm '
-                         '(default: %.2f, Zheltovodov low-Re case)' % (DELTA_EXP*MM))
+                         '(default: %.2f, Zheltovodov high-Re case)' % (DELTA_EXP*MM))
     ap.add_argument('--x-exp', type=float, default=None, metavar='MM',
                     help='station where it is measured, mm upstream of the corner '
-                         '(default: 15.4 * delta-exp)')
+                         '(default: 8.04 * delta-exp)')
     a = ap.parse_args()
 
-    # The station defaults to 15.4 delta, so it follows --delta-exp unless pinned.
+    # The station defaults to 8.04 delta, so it follows --delta-exp unless pinned.
+    # (Passing --delta-exp 2.27 alone therefore does NOT reproduce the lowRe
+    # table: that case measured at 15.4 delta, and the ratio is part of the
+    # case.  Use the low_RE copy of this script, or pin --x-exp 34.958 too.)
     DELTA_EXP = a.delta_exp/MM
-    X_EXP = -abs(a.x_exp)/MM if a.x_exp is not None else -15.4*DELTA_EXP
+    X_EXP = -abs(a.x_exp)/MM if a.x_exp is not None else -8.04*DELTA_EXP
 
     if a.tree:
         h, root = load(a.gridFile)
@@ -1553,11 +1873,19 @@ def main():
     case = Case(a.gridFile)
     stem = os.path.splitext(os.path.basename(a.gridFile))[0]
 
+    # The overlay defaults to context/ beside the script, so the usual
+    # invocation picks it up with no extra flag.
+    ctxdir = a.context or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       'context')
+    ref = {} if a.no_context else load_context(ctxdir)
+    if ref:
+        print('reference curves from %s: %s' % (ctxdir, ', '.join(sorted(ref))))
+
     if not a.no_figs:
         os.makedirs(a.outdir, exist_ok=True)
         for suffix, draw in (('flowfield', figure_flowfield), ('wall', figure_wall)):
             path = os.path.join(a.outdir, '%s_%s.png' % (stem, suffix))
-            draw(case, path, a.exag) if suffix == 'flowfield' else draw(case, path)
+            draw(case, path, a.exag) if suffix == 'flowfield' else draw(case, path, ref)
             print('wrote', path)
         print()
 

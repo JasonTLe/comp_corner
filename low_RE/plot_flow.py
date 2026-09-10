@@ -14,6 +14,11 @@ writes two PNGs next to wherever you run it, named after the input file:
     comp_corner_000_surf_wall.png        p/p_inf, Cf, y+ and the incoming
                                          boundary-layer profile
 
+If a context/ directory sits next to this script, the digitized paper curves
+in it (p*.csv, cf*.csv) are resampled into continuous lines and drawn over
+the p/p_inf and Cf panels.  --context DIR points somewhere else, --no-context
+turns the overlay off.
+
 and prints a table of derived quantities (separation length, shock angle,
 boundary-layer thickness, near-wall resolution, ...).
 
@@ -90,12 +95,15 @@ import sys
 import os
 import struct
 import argparse
+import glob
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')          # render to file; no display needed
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import matplotlib.patheffects as pe
+import matplotlib.colors as mcolors
+from matplotlib.tri import Triangulation, LinearTriInterpolator
 
 GAM = 1.4                      # ratio of specific heats
 KARMAN, BLOG = 0.41, 5.2       # log-law constants
@@ -893,8 +901,21 @@ class Case:
         negative means it is reversed.  The tangent is taken from the wall
         geometry itself, so a plate and a ramp are handled the same way.
         """
-        xs, ys, pr, cf, rw, Tw, cfm = [], [], [], [], [], [], []
+        # Which points are on a VISCOUS wall.  ADflow names the surface zones
+        # after the BC type -- EulerWallBCZone* for the two inviscid slip
+        # segments, NSWallIsothermal*/NSWallAdiabatic* for the plate and ramp --
+        # so the split is readable straight off the file.  It matters: y+ and
+        # T_w are only defined on a no-slip wall, and averaging the slip
+        # segments into them is what used to make this script report a T_w/T_inf
+        # well below the wall's actual value and a y+ minimum of 0.000 that was
+        # just the inviscid wall's zero shear.
+        xs, ys, pr, cf, rw, Tw, cfm, vs = [], [], [], [], [], [], [], []
+        wallBC = set()
         for z in zones:
+            viscous = 'NSWall' in z.name
+            if viscous:
+                wallBC.add('isothermal' if 'Isothermal' in z.name else
+                           'adiabatic' if 'Adiabatic' in z.name else 'viscous')
             X, Y, D = self._zone_arrays(z)
             order = np.argsort(X[0])
             xv, yv = X[0][order], Y[0][order]
@@ -912,12 +933,19 @@ class Case:
             rw.append(get('Density'))
             Tw.append(get('Temperature'))
             cfm.append(get('SkinFrictionMagnitude'))
+            vs.append(np.full(xs[-1].shape, viscous))
 
         cat = np.concatenate
         o = np.argsort(cat(xs))
         self.xw, self.yw = cat(xs)[o], cat(ys)[o]
         self.pw, self.cfw = cat(pr)[o], cat(cf)[o]
         self.rww, self.Tww, self.cfm = cat(rw)[o], cat(Tw)[o], cat(cfm)[o]
+        self.viscw = cat(vs)[o]
+        self.wallBC = '/'.join(sorted(wallBC)) if wallBC else 'viscous'
+        # Same mask on the field-cell abscissa self.xs, for y+ (set in
+        # _derive_quantities, which runs after this).
+        self._visc_x = (self.xw[self.viscw].min(), self.xw[self.viscw].max()) \
+                       if self.viscw.any() else (-np.inf, np.inf)
 
     # --- derived quantities -------------------------------------------------
 
@@ -949,6 +977,11 @@ class Case:
         T_w = np.interp(self.xs, x, self.Tww)*self.Tref
         self.utau = np.sqrt(np.abs(tau)/rho_w)
         self.yplus = rho_w*self.utau*self.dw/mu(T_w)
+        # y+ is a no-slip quantity.  Keep the full array for plotting (the
+        # inviscid stretches read ~0 and that is honest on a graph), but expose
+        # a viscous-only view for the min/mean/max the table reports.
+        lo, hi = self._visc_x
+        self.yplusv = self.yplus[(self.xs >= lo) & (self.xs <= hi)]
 
         # Incoming boundary layer, sampled 15 mm upstream of separation.
         self.x_ref = self.x_sep - 0.015
@@ -1128,6 +1161,172 @@ class Case:
 
 
 # =============================================================================
+#  Part 3b   Reference data digitized from the paper
+# =============================================================================
+#
+# The comparison curves in context/ come out of a plot digitizer, so they are
+# not quite a function of x.  On the steep parts -- the pressure jump, the Cf
+# plunge into the bubble, the spike at the corner -- the operator's x scatters
+# by a few tenths of a mm while y marches on, and in two places the trace
+# doubles back over itself.  x therefore decreases 31 times in cf_xl.csv.
+# Joined with a line those show up as zig-zags; drawn as markers the file
+# reads as scattered data, which it is not -- the paper draws one curve.
+#
+# Turning it back into that curve takes three steps:
+#
+#   1. sort by x and average y over the samples that share one x.  The jitter
+#      is small compared with the spacing of genuinely distinct stations, so
+#      sorting reorders only within the doubled-back runs, and averaging puts
+#      the curve through the middle of them.  What survives is the height of
+#      those near-vertical runs (~4e-4 in Cf at x = -9.7 and x = -0.3), which
+#      no single-valued y(x) can reproduce and which is invisible at the
+#      scale these panels are drawn at.
+#   2. interpolate with a monotone cubic (Fritsch-Carlson / PCHIP).  A natural
+#      cubic spline would ring at the pressure jump and dip Cf below its own
+#      data inside the bubble; the monotone form cannot overshoot, so the
+#      plateau stays flat and the jump stays a jump.
+#   3. evaluate on a dense uniform grid, so the drawn line is smooth at any
+#      figure size.
+#
+# Implemented here rather than pulled from scipy so that the script keeps its
+# numpy + matplotlib only requirement.
+
+REF_LABEL = 'Hao'
+# Electric violet, chosen by maximizing the smallest CIELAB distance to every
+# other colour on panels (a) and (b): ADflow's dark green, the crimson of the
+# inviscid line and the S/R markers, the pale orange band, and the black/grey
+# of the axes.  Its nearest neighbour is crimson at dE 125 -- and crimson,
+# marking separation and reattachment, is the one it must not be confused
+# with.  Magenta, the obvious alternative, manages only dE 55 there.  The
+# dashes keep the curve separable in greyscale as well; short ones (3 on,
+# 1.4 off) so the Cf spike at the corner still resolves as a spike.
+REF_COLOR = '#8b00ff'
+REF_DASH = (0, (3, 1.4))
+
+# Both wall panels draw ADflow in one colour, so the eye carries "this is the
+# computation" from the pressure panel down to the skin-friction panel.
+ADFLOW_COLOR = '#0b6b3a'
+N_REF = 1200                   # samples in the resampled reference curve
+
+
+def _pchip_slopes(x, y):
+    """Fritsch-Carlson tangents: the derivative estimate that cannot overshoot.
+
+    At an interior node the harmonic mean of the two neighbouring secants is
+    used, which vanishes whenever they disagree in sign.  That is what pins
+    the interpolant to the data at a local extremum (the bottom of the Cf
+    bubble, the top of the pressure plateau) instead of letting it swing past.
+    """
+    h = np.diff(x)
+    d = np.diff(y)/h                                  # secant slopes
+    m = np.zeros_like(y)
+
+    # Interior nodes: harmonic mean, weighted by the interval lengths.
+    same = np.sign(d[:-1])*np.sign(d[1:]) > 0
+    w1, w2 = 2*h[1:] + h[:-1], h[1:] + 2*h[:-1]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        m[1:-1] = np.where(same, (w1 + w2)/(w1/d[:-1] + w2/d[1:]), 0.0)
+
+    # Ends: one-sided three-point formula, clipped so it stays monotone.
+    def end(d0, d1, h0, h1):
+        s = ((2*h0 + h1)*d0 - h0*d1)/(h0 + h1)
+        if np.sign(s) != np.sign(d0):
+            return 0.0
+        if np.sign(d0) != np.sign(d1) and abs(s) > abs(3*d0):
+            return 3*d0
+        return s
+
+    m[0] = end(d[0], d[1], h[0], h[1]) if len(d) > 1 else d[0]
+    m[-1] = end(d[-1], d[-2], h[-1], h[-2]) if len(d) > 1 else d[-1]
+    return m
+
+
+def _pchip(x, y, xq):
+    """Evaluate the monotone cubic through (x, y) at xq, on the cubic Hermite
+    basis of each interval."""
+    m = _pchip_slopes(x, y)
+    k = np.clip(np.searchsorted(x, xq) - 1, 0, len(x) - 2)
+    h = x[k+1] - x[k]
+    t = (xq - x[k])/h
+    t2, t3 = t*t, t*t*t
+    return ((2*t3 - 3*t2 + 1)*y[k] + (t3 - 2*t2 + t)*h*m[k]
+            + (-2*t3 + 3*t2)*y[k+1] + (t3 - t2)*h*m[k+1])
+
+
+def load_reference(path, n=N_REF):
+    """One digitized curve as a continuous line.
+
+    Returns (x, y) sampled on a uniform grid across the file's x range, or
+    None if the file is missing or too short to interpolate.  The CSV is a
+    two-column "x, y" export with a header line; x is in mm, y in whatever
+    the panel plots.
+    """
+    if not os.path.isfile(path):
+        return None
+    d = np.atleast_2d(np.loadtxt(path, delimiter=',', skiprows=1))
+    if d.shape[0] < 2:
+        return None
+    x, y = d[:, 0], d[:, 1]
+
+    # Sort, then average the ties.  np.unique gives, for every sample, the
+    # index of the station it belongs to, so bincount sums and counts the
+    # duplicates in one pass.
+    xu, inv = np.unique(x, return_inverse=True)
+    yu = np.bincount(inv, weights=y)/np.bincount(inv)
+    if len(xu) < 2:
+        return None
+
+    xq = np.linspace(xu[0], xu[-1], n)
+    return xq, _pchip(xu, yu, xq)
+
+
+def zero_crossings(x, y):
+    """(x_sep, x_rea) of a Cf curve: where it falls through zero and where it
+    rises back.
+
+    Same convention as Case._derive_quantities -- the FIRST falling crossing
+    and the LAST rising one -- so that the small positive spike the corner
+    puts in the middle of the bubble is stepped over rather than mistaken for
+    reattachment followed by a second separation.  Kept here as a free
+    function because it has to run on the digitized curve too, which is not a
+    Case and has none of a Case's geometry.
+    """
+    def crossings(rising):
+        out = []
+        for i in range(len(y) - 1):
+            if y[i] != 0 and (y[i] > 0) != (y[i+1] > 0) \
+                    and (y[i+1] > y[i]) == rising:
+                out.append(x[i] + (x[i+1] - x[i])*(-y[i])/(y[i+1] - y[i]))
+        return out
+    sep, rea = crossings(False), crossings(True)
+    return (min(sep) if sep else np.nan,
+            max(rea) if rea else np.nan)
+
+
+def load_context(dirname):
+    """The paper's wall curves, keyed by the panel they belong to.
+
+    p*.csv    wall pressure ratio p/p_inf   -> panel (a)
+    cf*.csv   skin friction Cf              -> panel (b)
+
+    Matched by prefix rather than by exact name: the lowRe and highRe
+    directories hold the same two curves under different names (cf_xl.csv vs
+    cf_xl_high.csv), and a file that has been renamed should still be found.
+    The cf glob is tried first so that "cf*" never loses its files to "p*".
+    """
+    if not dirname or not os.path.isdir(dirname):
+        return {}
+    out = {}
+    for key, pattern in (('cf', 'cf*.csv'), ('p', 'p*.csv')):
+        for path in sorted(glob.glob(os.path.join(dirname, pattern))):
+            curve = load_reference(path)
+            if curve is not None:
+                out[key] = curve
+                break
+    return out
+
+
+# =============================================================================
 #  Part 4   Streamline tracing
 # =============================================================================
 #
@@ -1238,9 +1437,25 @@ def figure_flowfield(case, fname, exag=3.5):
     ax.set_xlim(x0d, x1d); ax.set_ylim(-1.2, y1d*1.02); ax.set_aspect('equal')
     ax.set_ylabel('y [mm]')
     fig.colorbar(pc, ax=ax, pad=.01, fraction=.022).set_label('M')
+    # The wall label used to be the hard-coded string 'adiabatic wall', which was
+    # simply false: both Zheltovodov cases are run ISOTHERMAL at 275.4 K (see
+    # mesh.py --Twall, applied to the CGNS by fix_bc.py).
+    #
+    # Take the label from the BOUNDARY CONDITION, not from comparing T_w against
+    # the recovery temperature.  A temperature test looks reasonable and is a
+    # trap: in the lowRe case T_w/T_inf = 2.550 sits only 0.6% below
+    # the adiabatic 2.566,
+    # so a "within 1% of adiabatic" rule would label an isothermal wall adiabatic
+    # on a numerical coincidence.  ADflow names the surface zone after the BC it
+    # applied -- NSWallIsothermalBCZone* here -- so the file already says it.
+    Tw_ratio = float(np.nanmean(case.Tww[case.viscw]))
+    wall = ('adiabatic wall' if case.wallBC == 'adiabatic' else
+            'isothermal wall T$_w$=%.1f K (T$_w$/T$_\\infty$=%.2f)'
+            % (Tw_ratio*case.Tref, Tw_ratio) if case.wallBC == 'isothermal' else
+            'viscous wall T$_w$/T$_\\infty$=%.2f' % Tw_ratio)
     ax.set_title('(a)  Mach number  —  %s  |  M$_\\infty$=%.2f, %.1f° corner, '
-                 'adiabatic wall, Re=%.2f×10$^7$ m$^{-1}$'
-                 % (case.label, case.Minf, case.ramp, case.Re_m/1e7),
+                 '%s, Re=%.2f×10$^7$ m$^{-1}$'
+                 % (case.label, case.Minf, case.ramp, wall, case.Re_m/1e7),
                  loc='left', fontsize=10.5, pad=5)
     ax.text(x0d + 0.02*(x1d - x0d), 0.83*y1d, 'white: sonic line M = 1',
             color='w', fontsize=8.5)
@@ -1270,6 +1485,11 @@ def figure_flowfield(case, fname, exag=3.5):
     d0 = case.delta0*MM
     x0 = case.x_sep*MM - 9*d0
     x1 = case.x_rea*MM + 9*d0
+    # Always keep the experiment's measuring station in frame -- it is what
+    # --plateLength is calibrated against, and it is annotated below.  It lands
+    # inside the 9*delta0 run-in for the highRe case but ~2 mm outside it for
+    # the lowRe one, so widen rather than let the marker fall off the axes.
+    x0 = min(x0, X_EXP*MM - 2.2*d0)
     y_reatt = np.interp(case.x_rea, case.xw, case.yw)*MM
     y0, y1 = -0.95*d0, y_reatt + 3.0*d0
 
@@ -1338,6 +1558,37 @@ def figure_flowfield(case, fname, exag=3.5):
             r'$L_{sep}$ = %.2f mm' % (case.Lsep*MM), color='0.1', fontsize=9,
             weight='bold', ha='center', va='bottom', zorder=11,
             path_effects=halo)
+    # --- the experiment's measuring station ---------------------------------
+    # delta at this fixed station, and the Re_delta built on it, are the two
+    # numbers the whole case is calibrated to (mesh.py --plateLength), so draw
+    # them rather than leaving them in the table.  The bar is the boundary-layer
+    # thickness TO SCALE, i.e. it carries the panel's vertical exaggeration like
+    # everything else here.
+    xe = X_EXP*MM
+    ye = np.interp(X_EXP, case.xw, case.yw)*MM
+    de = case.delta_exp*MM
+    cap = 0.20*d0
+    ax.plot([xe, xe], [ye, ye + de], color='#ffd400', lw=2.6,
+            solid_capstyle='butt', zorder=10.6, path_effects=halo)
+    for yy in (ye, ye + de):
+        ax.plot([xe - cap, xe + cap], [yy, yy], color='#ffd400', lw=2.2,
+                zorder=10.6, path_effects=halo)
+    # Anchor the caption in AXES fraction, not data coordinates, with a leader
+    # to the bar.  Placing it beside the bar in data units overflows the left
+    # spine whenever the station sits near the edge of the window -- which is
+    # exactly the lowRe case, where -15.4*delta lands 2 mm outside the
+    # separation-centred view and the caption ran off the axes.
+    ax.annotate('$\\delta$ = %.3f mm\n$Re_\\delta$ = %s\nat x = %.2f mm = %.2f$\\delta$'
+                % (de, format(int(round(case.Re_delta)), ',').replace(',', '\u2009'),
+                   xe, X_EXP/DELTA_EXP),
+                xy=(xe, ye + de), xycoords='data',
+                xytext=(0.015, 0.72), textcoords='axes fraction',
+                color='0.1', fontsize=8.5, ha='left', va='top', zorder=11,
+                bbox=dict(boxstyle='round,pad=0.30', fc='#fff4c2',
+                          ec='#b38f00', lw=0.9),
+                arrowprops=dict(arrowstyle='-', color='#ffd400', lw=1.6,
+                                shrinkA=4, shrinkB=2, path_effects=halo))
+
     xl = np.array([0, (x1 - 0)*0.85])
     ax.plot(xl, np.tan(beta)*xl, color='w', ls=(0, (6, 4)), lw=1.3, zorder=8)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
@@ -1356,7 +1607,7 @@ def figure_flowfield(case, fname, exag=3.5):
     plt.close(fig)
 
 
-def figure_wall(case, fname):
+def figure_wall(case, fname, ref=None):
     """Four-panel view of what happens at the wall.
 
     (a) p/p_inf: the plateau marks the separated region, and the final level
@@ -1366,7 +1617,11 @@ def figure_wall(case, fname):
         the buffer layer, which is the one place you do not want to sit.
     (d) The incoming boundary layer in wall units.  If the points follow
         u+ = y+ then the log law, the layer is genuinely turbulent there.
+
+    ref, if given, is the dict from load_context(): the paper's digitized
+    wall curves, drawn over panels (a) and (b) as continuous lines.
     """
+    ref = ref or {}
     p_inv = case.p_inviscid
     beta = oblique_shock_beta(case.Minf, np.radians(case.ramp))
     xw = case.xw*MM
@@ -1385,12 +1640,15 @@ def figure_wall(case, fname):
     #     p/p_inf = 1 + QD*Cp,   QD = 0.5*gamma*M_inf^2,
     # which for M_inf = 2.95 is p/p_inf = 1 + 6.092 Cp.
     ax = fig.add_subplot(gs[0, :])
-    ax.plot(xw, case.pw, color='#1f4e9c', lw=2.0)
+    ax.plot(xw, case.pw, color=ADFLOW_COLOR, lw=2.0, label='ADflow (SA-Edwards)')
+    if 'p' in ref:
+        ax.plot(*ref['p'], color=REF_COLOR, lw=1.8, ls=REF_DASH,
+                zorder=3, label=REF_LABEL)
     ax.axhline(p_inv, color='crimson', ls='--', lw=1.2,
                label='inviscid oblique shock, $p/p_\\infty$ = %.3f  ($C_p$ = %.3f)'
                      % (p_inv, case.cp_inviscid))
     ax.axvspan(xs, xr, color='#ffd9a0', alpha=.6, zorder=0,
-               label='separated region (%.2f → %.2f mm)' % (xs, xr))
+               label='separated region')
     ax.axhline(1.0, color='.6', lw=.8)
     ax.set_xlim(-40, 30); ax.set_ylim(0, 5) # ax.set_xlim(-W, W); ax.set_ylim(0.85, 1 + (p_inv - 1)*1.25)
     ax.set_ylabel('$p/p_\\infty$')
@@ -1402,28 +1660,65 @@ def figure_wall(case, fname):
 
     # --- (b) skin friction --------------------------------------------------
     ax = fig.add_subplot(gs[1, :])
-    ax.plot(xw, case.cfw, color='#0b6b3a', lw=2.0)
+    ax.plot(xw, case.cfw, color=ADFLOW_COLOR, lw=2.0, label='ADflow (SA-Edwards)')
+    if 'cf' in ref:
+        ax.plot(*ref['cf'], color=REF_COLOR, lw=1.8, ls=REF_DASH,
+                zorder=3, label=REF_LABEL)
     ax.axhline(0, color='k', lw=1.0)
-    ax.axvspan(xs, xr, color='#ffd9a0', alpha=.6, zorder=0)
-    ax.set_xlim(-40, 30); ax.set_ylabel('$C_f$ (wall-tangent)'); ax.grid(alpha=.25); ax.set_ylim(-0.002, 0.004)
+    ax.axvspan(xs, xr, color='#ffd9a0', alpha=.6, zorder=0,
+               label='separated region')
+    # After the span, not before: a legend only picks up what already exists.
+    ax.legend(fontsize=9, loc='upper left')
+    ax.set_xlim(-40, 30); ax.set_ylabel('$C_f$ (wall-tangent)'); ax.grid(alpha=.25); ax.set_ylim(-0.0030, 0.004)
     # Label S and R against the Cf curve -- Cf = 0 is what *defines* them, so
-    # this is the panel where they mean something.
+    # this is the panel where they mean something, and each badge is anchored
+    # to the point (x, 0) on the curve it belongs to.
     #
-    # Place them in axis fractions, not data units.  The old code put them at
-    # 0.7*max(Cf) over a window four bubble-lengths wide, which reaches onto the
-    # ramp where Cf recovers well past this panel's 0.004 limit: on
-    # comp_corner_18 that is y = 0.0087, twice the top of the axes.  Matplotlib
-    # does not clip text by default, so the two labels were drawn outside this
-    # panel and landed on top of the wall-pressure panel above -- which is why
-    # S and R appeared to belong to p/p_inf.  get_xaxis_transform() keeps x in
-    # data coordinates and y in axis fractions, so they cannot escape again.
-    for xx, txt, dx, ha in [(xs, 'S  %.2f mm' % xs, -1.5, 'right'),
-                            (xr, 'R  %.2f mm' % xr, 1.5, 'left')]:
-        ax.axvline(xx, color='crimson', lw=1.1, ls='--')
-        ax.text(xx + dx, 0.90, txt, fontsize=9, color='crimson', ha=ha,
-                va='center', transform=ax.get_xaxis_transform())
-    ax.set_title('(b)  Skin friction  —  L$_{sep}$ = %.2f mm = %.1f δ$_0$'
-                 % (case.Lsep*MM, case.Lsep/case.delta0), loc='left', fontsize=10.5, pad=5)
+    # Hao's stations are read off the digitized curve with the same rule the
+    # solution gets, rather than taken from the paper's text: whatever bias
+    # the digitizing introduced then lands on both the curve and its markers,
+    # so the S-to-S and R-to-R gaps drawn here are a like-for-like comparison.
+    #
+    # Two rows, because the two curves separate within a millimetre of each
+    # other and badges on one row would collide.  ADflow's sit at Cf =
+    # -0.0019, Hao's below at -0.0026, which is what the extra 1e-3 of bottom
+    # margin above is for: both rows have to clear the floor of the bubble
+    # (-0.0014 here) as well as each other, since the offsets are not enough
+    # to carry them clear of it horizontally.
+    #
+    # The outer offset belongs to the UPPER row.  Give both rows the same one
+    # and the lower badge's leader, climbing inward from further down, rules a
+    # line straight through the upper badge's text -- which is what it did.
+    # Pairing outer-with-upper (8 mm) and inner-with-lower (3 mm) makes the
+    # lower leader the steeper of the two, so it starts inboard of the upper
+    # badge and never reaches it.  Each badge takes the colour of its own
+    # curve -- the crimson these used to be matched neither one.  Offsets go
+    # outward, S left and R right, so the leaders splay apart rather than
+    # lean across the bubble between them.
+    halo = [pe.withStroke(linewidth=2.6, foreground='w')]
+    rows = [(xs, xr, ADFLOW_COLOR, -0.0019, 8.0)]
+    if 'cf' in ref:
+        hs, hr = zero_crossings(*ref['cf'])
+        if np.isfinite(hs) and np.isfinite(hr):
+            rows.append((hs, hr, REF_COLOR, -0.0026, 3.0))
+    for x_s, x_r, colour, y_lab, dx in rows:
+        for tag, xx, side in [('S', x_s, -1), ('R', x_r, +1)]:
+            ax.plot([xx], [0.0], 'o', ms=6, mfc='w', mec=colour, mew=1.6,
+                    zorder=6)
+            ax.annotate('%s  %.2f mm' % (tag, xx), xy=(xx, 0.0),
+                        xytext=(xx + side*dx, y_lab),
+                        color=colour, fontsize=9, weight='bold',
+                        ha='center', va='center', zorder=7, path_effects=halo,
+                        arrowprops=dict(arrowstyle='-', color=colour, lw=1.1,
+                                        shrinkA=3, shrinkB=5,
+                                        path_effects=halo))
+    title = ('(b)  Skin friction  —  L$_{sep}$ = %.2f mm = %.1f δ$_0$'
+             % (case.Lsep*MM, case.Lsep/case.delta0))
+    if len(rows) > 1:
+        title += '   (%s: %.2f mm, %+.1f%%)' % (
+            REF_LABEL, rows[1][1] - rows[1][0],
+            100*((rows[1][1] - rows[1][0])/(case.Lsep*MM) - 1))
+    ax.set_title(title, loc='left', fontsize=10.5, pad=5)
 
     # --- (c) near-wall resolution -------------------------------------------
     ax = fig.add_subplot(gs[2, 0])
@@ -1436,8 +1731,9 @@ def figure_wall(case, fname):
     ax.set_xlim(x_left, case.xs.max()*MM); ax.set_ylim(1e-2, 60)
     ax.set_xlabel('x [mm]'); ax.set_ylabel('$y^+$ of first cell')
     ax.grid(alpha=.25, which='both')
-    ax.set_title('(c)  $y^+$ = %.2f – %.2f (mean %.2f);  first cell %.2f–%.2f µm'
-                 % (case.yplus.min(), case.yplus.max(), case.yplus.mean(),
+    ax.set_title('(c)  $y^+$ = %.2f – %.2f (mean %.2f) on the viscous wall;'
+                 '  first cell %.2f–%.2f µm'
+                 % (case.yplusv.min(), case.yplusv.max(), case.yplusv.mean(),
                     case.dw.min()*1e6, case.dw.max()*1e6),
                  loc='left', fontsize=10.5, pad=5)
 
@@ -1458,6 +1754,357 @@ def figure_wall(case, fname):
     fig.savefig(fname, dpi=165)
     plt.close(fig)
 
+
+# =============================================================================
+#  Part 5b   Hao's flow-field panel, reproduced
+# =============================================================================
+#
+# A like-for-like redraw of figure 8(a) of Hao (JFM 2023): filled bands of
+# u/u_inf, the sonic-free "u = 0.99" contour, the bubble outline and the S/R
+# circles, on the paper's own axes.  The point is that the two can be laid
+# side by side and read as one picture, so every styling choice below is
+# copied from the screenshot in context/ rather than chosen.
+#
+# WHAT L IS.  The paper labels its axes x/L and y/L and never fixes L in the
+# caption, but the screenshot pins it: its boundary-layer edge sits at
+# y/L = 2.27 on the plate and its S and R circles at x/L = -10.4 and 8.8.
+# Those are delta = 2.27 mm and the separation and reattachment this case
+# already reports in millimetres, so L = 1 mm and the paper's axes are simply
+# x and y in mm.  (The same reading makes the highRe panel's edge y/L = 4.1
+# match its delta = 4.1 mm, and it is what lets the digitized wall curves in
+# context/ overlay the solution directly -- had L been delta, they would have
+# missed by a factor of 2.27 and nothing would have lined up.)
+#
+# THE COLOURS.  The screenshot's bands were sampled and fitted against
+# matplotlib's families: RdYlBu_r truncated to [0.06, 0.84] over 12 bands
+# reproduces them to a mean error of 8/255 per channel.  The truncation is
+# the part worth keeping -- the paper's top band is a coral, not RdYlBu_r's
+# maroon endpoint, and the bubble bottoms out at a mid blue rather than navy,
+# so an untruncated map reads far darker at both ends than the original.
+PAPER_CMAP = ('RdYlBu_r', 0.06, 0.84)
+PAPER_BANDS = 12
+PAPER_ULIM = (-0.1, 1.0)       # the colour range the paper annotates
+
+# Pixel frame of panel (a) inside context/flowfield.png: left, right, top,
+# bottom.  Used only to crop the screenshot for the side-by-side, so that its
+# data area and ours line up edge to edge instead of by eye.
+#
+# The limits below are measured off the screenshot rather than read from its
+# tick labels, because the labels only pin x.  Tracing the white-to-colour
+# boundary gives the wall: flat to col 347, then a ramp of -0.461 px/px.  The
+# ramp is 25 deg by construction, so px-per-y = 0.461*px-per-x/tan(25 deg) =
+# px-per-x -- the panel is equal aspect, which is worth knowing because a
+# guess of "y runs 0 to 17" is off by enough to bend every shock angle in the
+# comparison.  y = 0 lands on row 258, sixteen rows above the frame, so the
+# panel carries a white strip below the wall; reproducing that strip is what
+# keeps the two wall lines at the same height when the panels are stacked.
+PAPER_CROP = (105, 589, 48, 274)
+PAPER_XLIM = (-20.0, 20.0)
+PAPER_YLIM = (-1.32, 17.33)
+
+
+def paper_cmap():
+    """The screenshot's colormap: RdYlBu_r with both ends trimmed."""
+    name, lo, hi = PAPER_CMAP
+    base = plt.get_cmap(name)
+    return mcolors.LinearSegmentedColormap.from_list(
+        'paper', base(np.linspace(lo, hi, 256)))
+
+
+# Confidence radius for calling a pixel "flat fill".  The distance-to-nearest
+# -band distribution has its bulk under 0.09 (JPEG noise inside a band) and a
+# long tail past 0.19 (ink, edges, white); 0.10 sits in the gap.
+FILL_TAU = 0.10
+
+
+def load_shot(ref_png):
+    """The screenshot cropped to panel (a), plus the (x/L, y/L) of every pixel."""
+    l, r, t, b = PAPER_CROP
+    img = plt.imread(ref_png)[t:b, l:r, :3].astype(float)
+    if img.max() > 1.001:                      # 8-bit PNG rather than float
+        img /= 255.0
+    H, W = img.shape[:2]
+    X, Y = np.meshgrid(np.linspace(*PAPER_XLIM, W),
+                       np.linspace(PAPER_YLIM[1], PAPER_YLIM[0], H))
+    return img, X, Y
+
+
+def restore_shot(img, X, Y):
+    """Undo the screenshot's JPEG noise, inventing nothing.
+
+    The paper's panel is a DISCRETE contour plot: away from its lines, every
+    pixel was originally one of twelve flat colours.  Compression turned each
+    of those flats into a cloud with a standard deviation of about 0.01 per
+    channel, plus ringing along every band edge.  That is recoverable damage,
+    because the clean value of a flat pixel is not a guess -- it is the colour
+    the rest of its own band already has.
+
+    So: classify each pixel to a band, take the MEASURED median colour of each
+    band from this image, and repaint the confidently-flat pixels with it.
+    The median is the point -- an earlier version repainted with the fitted
+    RdYlBu_r palette instead, which is a different picture's colours, off by
+    0.044 in green on the free stream.  Nothing here comes from outside the
+    screenshot.
+
+    Everything that is not confidently flat is left exactly as it was: the
+    dashed contours, the wall, the S and R circles, the text, the colour key,
+    the antialiased pixels along every edge, and the white under the wall.
+    Those keep their original blur.  This raises no detail and moves no
+    boundary; it only flattens what was already meant to be flat.
+
+    Returns (restored image, fraction of pixels repainted).
+    """
+    bands = paper_cmap()((np.arange(PAPER_BANDS) + 0.5)/PAPER_BANDS)[:, :3]
+    d = np.linalg.norm(img[:, :, None, :] - bands[None, None, :, :], axis=3)
+    idx, dmin = d.argmin(2), d.min(2)
+
+    # Below the wall is white by construction, never a band; letting it snap
+    # to the palest band would repaint the blank half of the panel.
+    wall = np.maximum(X, 0.0)*np.tan(np.radians(25.0))
+    fill = (dmin < FILL_TAU) & (Y > wall + 0.15)
+    fill &= ~((X > -18.5) & (X < -2.5) & (Y > 11.5))          # colour key
+
+    # Drop isolated misclassifications: a pixel whose band is shared by at
+    # most one of its eight neighbours, inside a neighbourhood that agrees on
+    # some other band.  A pixel ON a band edge has neighbours of both bands,
+    # so it fails the test and is left alone -- the filter cannot walk an edge.
+    pad = np.pad(np.where(fill, idx, -1), 1, constant_values=-1)
+    shifts = [pad[a:a+idx.shape[0], b:b+idx.shape[1]]
+              for a in (0, 1, 2) for b in (0, 1, 2) if (a, b) != (1, 1)]
+    counts = np.stack([sum((s == k).astype(np.int8) for s in shifts)
+                       for k in range(PAPER_BANDS)])
+    own = np.take_along_axis(counts, idx[None], 0)[0]
+    best = counts.argmax(0)
+    lone = fill & (own <= 1) & (counts.max(0) >= 7)
+    idx = np.where(lone, best, idx)
+
+    out = img.copy()
+    for k in range(PAPER_BANDS):
+        sel = fill & (idx == k)
+        if sel.sum() >= 40:                       # enough to trust a median
+            out[sel] = np.median(img[sel], axis=0)
+    return out, float(fill.mean())
+
+
+def paper_raster(img, X, Y):
+    """Invert the screenshot back into a field of u/u_inf.
+
+    Because the bands are discrete and their colours are now known, the
+    screenshot can be read rather than merely looked at: classify each pixel
+    to the nearest of the twelve band colours and it returns the band, hence
+    u to within half a band (+-0.046).  That is enough to subtract one
+    solution from the other and see WHERE they differ rather than guessing
+    from two pictures side by side.
+
+    Returns (u, valid) on the screenshot's own pixel raster.  `valid` drops
+    everything that is not field: the region under the wall, the black of the
+    dashed contours and the wall line, the colour key, and any pixel whose
+    colour is too far from every band to classify.  Fed the restored image
+    rather than the raw one, that last category shrinks to the edges alone.
+    """
+    edges = np.linspace(PAPER_ULIM[0], PAPER_ULIM[1], PAPER_BANDS + 1)
+    centres = 0.5*(edges[:-1] + edges[1:])
+    bands = paper_cmap()((np.arange(PAPER_BANDS) + 0.5)/PAPER_BANDS)[:, :3]
+    d = np.linalg.norm(img[:, :, None, :] - bands[None, None, :, :], axis=3)
+
+    # Black text and black contour lines are far from every band colour, so
+    # the distance test throws them out on its own -- the Re label needs no
+    # rectangle, and cutting one would have blanked a stripe of real field
+    # across the ramp.  The colour key does need one: it is a smooth ramp of
+    # the very colours being matched, so every pixel of it classifies as
+    # good field.
+    wall = np.maximum(X, 0.0)*np.tan(np.radians(25.0))
+    valid = (d.min(2) < 0.10) & (Y > wall + 0.15)
+    valid &= ~((X > -18.5) & (X < -2.5) & (Y > 11.5))            # colour key
+    return centres[d.argmin(2)], valid
+
+
+def sample_field(case, F, X, Y):
+    """F, given on the curvilinear cell centres, sampled at (X, Y).
+
+    The grid is curvilinear, so the structured cells are handed to
+    matplotlib's triangulation as two triangles each -- exact connectivity,
+    no Delaunay pass and no scipy.  Masked wherever (X, Y) falls outside the
+    mesh, which is everything under the wall and above the far field.
+    """
+    Xc, Yc = case.Xc*MM, case.Yc*MM
+    i = np.where((Xc[0] > PAPER_XLIM[0] - 4) & (Xc[0] < PAPER_XLIM[1] + 4))[0]
+    Xc, Yc, F = Xc[:, i], Yc[:, i], F[:, i]
+    j = np.where(Yc.min(1) < PAPER_YLIM[1] + 5)[0]
+    Xc, Yc, F = Xc[j], Yc[j], F[j]
+
+    nj, ni = Xc.shape
+    ids = np.arange(nj*ni).reshape(nj, ni)
+    a, b, c, d = ids[:-1, :-1], ids[:-1, 1:], ids[1:, 1:], ids[1:, :-1]
+    tris = np.concatenate([np.stack([a, b, c], -1).reshape(-1, 3),
+                           np.stack([a, c, d], -1).reshape(-1, 3)])
+    interp = LinearTriInterpolator(
+        Triangulation(Xc.ravel(), Yc.ravel(), tris), F.ravel())
+    return interp(X, Y)
+
+
+def _paper_axes(ax, xlabel=True, ylabel=True):
+    """The screenshot's axes, to the pixel."""
+    ax.set_xlim(*PAPER_XLIM); ax.set_ylim(*PAPER_YLIM); ax.set_aspect('equal')
+    ax.set_xticks([-20, -10, 0, 10, 20]); ax.set_yticks([0, 5, 10, 15])
+    ax.tick_params(direction='in', top=True, right=True, labelsize=9)
+    if xlabel:
+        ax.set_xlabel('$x/L$')
+    if ylabel:
+        ax.set_ylabel('$y/L$')
+
+
+def _draw_paper_field(case, ax):
+    """Panel (b): this solution, in the paper's own bands."""
+    U = np.clip(case.u/case.ue, *PAPER_ULIM)
+    levels = np.linspace(PAPER_ULIM[0], PAPER_ULIM[1], PAPER_BANDS + 1)
+    ax.contourf(case.Xc*MM, case.Yc*MM, U, levels=levels, cmap=paper_cmap(),
+                zorder=1)
+    ax.contour(case.Xc*MM, case.Yc*MM, U, levels=[0.0, 0.99], colors='k',
+               linestyles='--', linewidths=1.0, zorder=4)
+    _draw_paper_wall(case, ax)
+
+
+def _draw_paper_wall(case, ax):
+    ax.plot(case.X[0]*MM, case.Y[0]*MM, 'k-', lw=1.1, zorder=6)
+    ax.fill_between(case.X[0]*MM, case.Y[0]*MM, PAPER_YLIM[0] - 5,
+                    color='w', zorder=5)
+    for xm in (case.x_sep*MM, case.x_rea*MM):
+        ax.plot([xm], [np.interp(xm, case.xw*MM, case.yw*MM)], 'o', ms=5,
+                mfc='none', mec='0.25', mew=1.2, zorder=7)
+
+
+def _draw_paper_key(ax):
+    """The inset colour key, where the screenshot puts it."""
+    cax = ax.inset_axes([0.161, 0.750, 0.093, 0.168])
+    cax.imshow(np.linspace(1, 0, 256).reshape(-1, 1), cmap=paper_cmap(),
+               aspect='auto')
+    cax.set_xticks([]); cax.set_yticks([])
+    for sp in cax.spines.values():
+        sp.set_linewidth(0.8)
+    ax.text(0.150, 0.834, '$u/u_\\infty$', transform=ax.transAxes,
+            fontsize=10, ha='right', va='center')
+    for frac, txt in ((0.905, '1'), (0.762, '$-0.1$')):
+        ax.text(0.268, frac, txt, transform=ax.transAxes, fontsize=9,
+                ha='left', va='center')
+
+
+def figure_paper(case, fname, ref_png=None):
+    """Hao figure 8(a) and this solution, side by side and differenced.
+
+    Without the screenshot, one panel: this solution drawn on the paper's
+    axes.  With it, four:
+
+      (a) the screenshot, cropped to its own frame
+      (b) this solution in the same bands
+      (c) this solution's u = 0 and u = 0.99 contours laid over (a), which is
+          the registration check -- if the bubble and the shock sit on the
+          paper's own dashed lines, the two runs agree where it matters
+      (d) the two fields subtracted, by reading the screenshot's bands back
+          into numbers.  Blue means this solution is slower than Hao's there,
+          red faster; +-1 band is the quantisation floor of (a), so anything
+          inside the palest tint is agreement to the limit of what a
+          screenshot can be asked.
+    """
+    have_ref = bool(ref_png) and os.path.isfile(ref_png)
+    if not have_ref:
+        fig = plt.figure(figsize=(7.6, 3.9))
+        ax = fig.add_axes([0.105, 0.145, 0.87, 0.80])
+        _draw_paper_field(case, ax)
+        _draw_paper_key(ax)
+        _paper_axes(ax)
+        ax.text(0.94, 0.17, '$Re_\\delta$ = %s'
+                % format(int(round(case.Re_delta)), ',').replace(',', '\\,'),
+                transform=ax.transAxes, fontsize=10, ha='right', va='center')
+        fig.savefig(fname, dpi=200)
+        plt.close(fig)
+        return
+
+    raw, Xp, Yp = load_shot(ref_png)
+    shot, repainted = restore_shot(raw, Xp, Yp)
+    extent = [PAPER_XLIM[0], PAPER_XLIM[1], PAPER_YLIM[0], PAPER_YLIM[1]]
+
+    # The restored crop is worth having on its own, not only as a tile here.
+    stem = os.path.splitext(fname)[0]
+    plt.imsave(stem.replace('_paper', '') + '_hao_restored.png', shot)
+
+    fig = plt.figure(figsize=(13.2, 7.4))
+    gs = GridSpec(2, 2, hspace=0.16, wspace=0.10,
+                  left=0.055, right=0.985, top=0.945, bottom=0.075)
+    axes = [fig.add_subplot(gs[k//2, k % 2]) for k in range(4)]
+
+    # (a) the screenshot ----------------------------------------------------
+    axes[0].imshow(shot, aspect='auto', extent=extent, origin='upper')
+    _paper_axes(axes[0], xlabel=False)
+    axes[0].set_title('(a)  Hao, JFM 2023, figure 8(a)   $Re_\\delta$ = %d'
+                      '   (%.0f%% of pixels de-compressed)'
+                      % (RE_DELTA_EXP, 100*repainted), loc='left', fontsize=10)
+
+    # (b) this solution -----------------------------------------------------
+    _draw_paper_field(case, axes[1])
+    _draw_paper_key(axes[1])
+    _paper_axes(axes[1], xlabel=False, ylabel=False)
+    axes[1].set_title('(b)  this solution   $Re_\\delta$ = %d   %s'
+                      % (int(round(case.Re_delta)), case.label),
+                      loc='left', fontsize=10)
+
+    # (c) registration ------------------------------------------------------
+    # Lime over a red-and-blue screenshot, haloed in black: the one hue that
+    # stays visible over the free stream, the bubble and the white below the
+    # wall alike.  Hao's own contours are the black dashes underneath, so
+    # where the two agree the lime sits directly on top of them.
+    axes[2].imshow(shot, aspect='auto', extent=extent, origin='upper')
+    U = np.clip(case.u/case.ue, *PAPER_ULIM)
+    cs = axes[2].contour(case.Xc*MM, case.Yc*MM, U, levels=[0.0, 0.99],
+                         colors='#39ff14', linewidths=1.6, zorder=4)
+    for coll in cs.collections:
+        coll.set_path_effects([pe.withStroke(linewidth=3.0, foreground='k')])
+    _paper_axes(axes[2])
+    axes[2].set_title('(c)  this solution\'s $u$ = 0 and $u$ = 0.99 '
+                      '(green) over (a)', loc='left', fontsize=10)
+
+    # (d) difference --------------------------------------------------------
+    # Quantise THIS solution into the same twelve bands before subtracting.
+    # The screenshot can only report a band centre, so its free stream reads
+    # 0.954 where ours reads 1.0; differencing the raw fields printed that
+    # 0.046 offset as a uniform half-band tint over the whole free stream --
+    # an artefact of the palette, not a disagreement.  Binned the same way,
+    # the difference is in whole bands and answers the question actually
+    # being asked: how far apart are the two pictures, in the units the
+    # picture is drawn in.
+    up, valid = paper_raster(shot, Xp, Yp)
+    X, Y = Xp, Yp
+    edges = np.linspace(PAPER_ULIM[0], PAPER_ULIM[1], PAPER_BANDS + 1)
+    centres = 0.5*(edges[:-1] + edges[1:])
+    um = sample_field(case, U, X, Y)
+    ok = valid & ~np.ma.getmaskarray(um)
+    umq = centres[np.clip(np.digitize(np.ma.getdata(um), edges) - 1,
+                          0, PAPER_BANDS - 1)]
+    dU = np.ma.masked_where(~ok, umq - up)
+    band = (PAPER_ULIM[1] - PAPER_ULIM[0])/PAPER_BANDS
+    # Grey, not white, for what could not be read: white would pass for
+    # "no difference here" next to the pale centre of the diverging map.
+    dcmap = plt.get_cmap('RdBu_r').copy()
+    dcmap.set_bad('0.86')
+    im = axes[3].imshow(dU/band, aspect='auto', extent=extent, origin='upper',
+                        cmap=dcmap, vmin=-2.5, vmax=2.5,
+                        interpolation='nearest')
+    _draw_paper_wall(case, axes[3])
+    _paper_axes(axes[3], ylabel=False)
+    cb = fig.colorbar(im, ax=axes[3], fraction=0.031, pad=0.015,
+                      ticks=[-2, -1, 0, 1, 2])
+    cb.set_label('bands apart  (this $-$ Hao)', fontsize=9)
+    cb.ax.tick_params(labelsize=8)
+    nb = np.abs(dU[ok])/band
+    axes[3].set_title('(d)  difference:  %.0f%% same band, %.0f%% within one, '
+                      'rms %.2f'
+                      % (100*float((nb < 0.5).mean()),
+                         100*float((nb < 1.5).mean()),
+                         float(np.sqrt((nb**2).mean()))),
+                      loc='left', fontsize=10)
+
+    fig.savefig(fname, dpi=170)
+    plt.close(fig)
 
 # =============================================================================
 #  Part 6   Command line
@@ -1493,9 +2140,9 @@ REPORT = [
     ('beta theory [deg]',   lambda c: '%.2f' % np.degrees(
                                 oblique_shock_beta(c.Minf, np.radians(c.ramp)))),
     ('1st cell [um]',       lambda c: '%.2f - %.2f' % (c.dw.min()*1e6, c.dw.max()*1e6)),
-    ('y+ min/mean/max',     lambda c: '%.3f / %.3f / %.3f' % (c.yplus.min(),
-                                c.yplus.mean(), c.yplus.max())),
-    ('T_w/T_inf',           lambda c: '%.4f' % np.nanmean(c.Tww)),
+    ('y+ min/mean/max',     lambda c: '%.3f / %.3f / %.3f  (viscous wall only)'
+                                % (c.yplusv.min(), c.yplusv.mean(), c.yplusv.max())),
+    ('T_w/T_inf',           lambda c: '%.4f' % np.nanmean(c.Tww[c.viscw])),
     ('  adiabatic theory',  lambda c: '%.4f' % (1 + 0.9*(GAM-1)/2*c.Minf**2)),
     ('reverse-flow cells',  lambda c: '%d' % int((c.u < 0).sum())),
 ]
@@ -1528,6 +2175,12 @@ def main():
                     help='print the CGNS tree and exit, making no figures')
     ap.add_argument('--no-figs', action='store_true',
                     help='print the table only, make no figures')
+    ap.add_argument('--context', default=None, metavar='DIR',
+                    help='directory of digitized reference curves (p*.csv, '
+                         'cf*.csv) to overlay on the wall figure '
+                         '(default: a context/ directory next to this script)')
+    ap.add_argument('--no-context', action='store_true',
+                    help='skip the reference overlay even if context/ exists')
     ap.add_argument('--exag', type=float, default=3.5,
                     help='vertical exaggeration hint for the close-up panel')
     ap.add_argument('--delta-exp', type=float, default=DELTA_EXP*MM, metavar='MM',
@@ -1553,11 +2206,25 @@ def main():
     case = Case(a.gridFile)
     stem = os.path.splitext(os.path.basename(a.gridFile))[0]
 
+    # The overlay defaults to context/ beside the script, so the usual
+    # invocation picks it up with no extra flag.
+    ctxdir = a.context or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       'context')
+    ref = {} if a.no_context else load_context(ctxdir)
+    if ref:
+        print('reference curves from %s: %s' % (ctxdir, ', '.join(sorted(ref))))
+
     if not a.no_figs:
         os.makedirs(a.outdir, exist_ok=True)
-        for suffix, draw in (('flowfield', figure_flowfield), ('wall', figure_wall)):
+        # The paper panel takes the screenshot rather than the CSVs, so it
+        # looks for it in the same context/ directory the curves came from.
+        ref_png = os.path.join(ctxdir, 'flowfield.png') if not a.no_context else None
+        draws = (('flowfield', figure_flowfield, a.exag),
+                 ('wall', figure_wall, ref),
+                 ('paper', figure_paper, ref_png))
+        for suffix, draw, extra in draws:
             path = os.path.join(a.outdir, '%s_%s.png' % (stem, suffix))
-            draw(case, path, a.exag) if suffix == 'flowfield' else draw(case, path)
+            draw(case, path, extra)
             print('wrote', path)
         print()
 

@@ -1,6 +1,11 @@
 """
 STAGE 2 of 2 -- SA-Edwards&Chandra restarted from the stage-1 SA solution.
 
+highRe case: M = 2.88, Re_delta = 132 840, delta = 4.1 mm at 8.04 delta
+upstream of the corner. The free stream comes from flow_conditions.make_ap(),
+the same call stage 1 makes -- it MUST be, because this stage restarts from
+stage 1's converged volume file. Do not write a literal AeroProblem here.
+
 HOW SA-Edwards IS ACTUALLY SELECTED IN THIS FORK
 ------------------------------------------------
 There are two *different* knobs and only one of them does anything:
@@ -40,8 +45,9 @@ state; the two checks are OR'd (line 1761).
 USAGE:
     BE CAREFUL WITH THE NUMBER OF PROCS YOU USE. COARSENING DOES NOT ALLOW A CERTAIN AMOUNT OF PROCS DUE TO UNEVEN SPLIT
 
-    For comp_corner_20_fixed.cgns (one 1185x145x3 node = 1184x144x2 cell block)
-    that means nProc = 8 or 16; 14 aborts in coarseUtils.F90:1528 with
+    For comp_corner_21_fixed.cgns (one 1153x157x3 node = 1152x156x2 cell block)
+    mesh.py's checkMultigrid reports even splits at nProc = 2, 3, 4, 6, 8, 9,
+    12, 16, 18, 24, 32, 36; anything else aborts in coarseUtils.F90:1528 with
     "Non-matching block-to-block face" because the sub-block cuts stop being
     1-to-1 after the "2w" coarsening. Use 16, the same as stage 1 -- it is also
     one rank per physical core on this host (see stage 1's header).
@@ -49,22 +55,29 @@ USAGE:
     the coarse level is doing real work rather than sitting unused.
 
     mpiexec -n 16 python3 adflow_run2.py \
-        --gridFile ./meshes/comp_corner_20_fixed.cgns \
+        --gridFile ./meshes/comp_corner_21_fixed.cgns \
         --restartFile ./output_SA/comp_corner_sa_000_vol.cgns
 
-    Runtime at these settings, 16 ranks: stage 1 ~430 s, stage 2 ~4000 s (it
-    runs the full --nCycles; see the note on useANKSolver).
+    Runtime at these settings, 16 ranks: on the lowRe grid stage 1 was ~430 s
+    and stage 2 ~4000 s (it runs the full --nCycles; see the note on
+    useANKSolver). This grid is 5% larger, so scale accordingly -- and budget
+    for the whole thing more than once, because --plateLength still has to be
+    calibrated against delta = 4.1 mm and each calibration step is a full
+    two-stage run. See the note on --plateLength in mesh.py.
 """
 
 import argparse
 import os
 
 from adflow import ADFLOW
-from baseclasses import AeroProblem
 from mpi4py import MPI
 
+# Shared with adflow_run1.py and eigen_run.py -- see the note at the top of
+# that file on Re_delta vs the quoted density.
+import flow_conditions
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_20_fixed.cgns")
+parser.add_argument("--gridFile", type=str, default="./meshes/comp_corner_21_fixed.cgns")
 parser.add_argument(
     "--restartFile",
     type=str,
@@ -80,6 +93,29 @@ parser.add_argument(
          "actually ends the run. Lower it only for calibration sweeps, and "
          "check res rho has plateaued at whatever value you pick -- res nuturb "
          "floors early and totalRes hides res rho behind it.",
+)
+parser.add_argument(
+    "--useNK",
+    action="store_true",
+    help="Hand the endgame to the Newton-Krylov solver. OFF by default, which "
+         "is what the useANKSolver note above describes: DADI alone stalls on "
+         "a residual floor. That floor is tolerable when the field is only "
+         "being reported, and NOT tolerable when it is about to be linearised "
+         "-- eigen_run.py needs dR/dw at R(w)=0, and on grid 21 the DADI floor "
+         "sat 5.4 orders above the L2Convergence target (totalR 83.45 against "
+         "a 3.25e-4 target), which poisons the eigenvalues nearest the origin. "
+         "Turn this on for any run whose output feeds a stability analysis. "
+         "Safe here only because useBlockettes is False -- see the block above.",
+)
+parser.add_argument(
+    "--NKSwitchTol",
+    type=float,
+    default=1e-6,
+    help="Relative totalR at which DADI hands over to NK. Measured against "
+         "totalR0 = 3.25e8 on this grid, so the default 1e-6 switches at "
+         "totalR = 325; the DADI floor is 83.45, well below that, so the "
+         "switch does fire. This is the value the earlier version of this file "
+         "used before NK was removed.",
 )
 args = parser.parse_args()
 outputDirectory = "./output_SAE"
@@ -196,7 +232,8 @@ aeroOptions = {
     # If NK is ever switched back on here, useBlockettes MUST stay False (see
     # the block above) or ANK/NK will silently solve standard SA instead.
     "useANKSolver": False,
-    "useNKSolver": False,
+    "useNKSolver": args.useNK,
+    "NKSwitchTol": args.NKSwitchTol,
     # Termination Criteria
     # L2Convergence is measured against the FREE-STREAM residual. On
     # comp_corner_15_fixed that is totalR0 = 3.74e8 (grid 14 was 1.947e8), so
@@ -216,16 +253,8 @@ aeroOptions = {
 }
 
 # Must match adflow_run1.py exactly.
-ap = AeroProblem(
-    name="comp_corner_sa_edwards",
-    mach=2.95,
-    reynolds=63560,
-    T=108.0,
-    reynoldsLength=2.27e-3,
-    areaRef=1.0,
-    chordRef=1.0,
-    evalFuncs=[],
-)
+ap = flow_conditions.make_ap("comp_corner_sa_edwards")
+flow_conditions.report(ap, comm)
 
 CFDSolver = ADFLOW(options=aeroOptions)
 
